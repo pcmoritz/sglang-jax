@@ -281,9 +281,11 @@ class Scheduler(
         if mesh is not None:
             self.mesh = mesh
         else:
+            devices = jax.devices("tt") if server_args.device == "tt" else None
             self.mesh = create_device_mesh(
                 ici_parallelism=[self.dp_size, self.tp_size // self.dp_size],
                 dcn_parallelism=[1, 1],
+                devices=devices,
                 device_indexes=server_args.device_indexes,
             )
 

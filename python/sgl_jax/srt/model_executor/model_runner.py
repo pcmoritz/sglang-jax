@@ -1,6 +1,7 @@
 """ModelRunner runs the forward passes of the models."""
 
 import logging
+import os
 from functools import partial
 
 import jax
@@ -27,7 +28,7 @@ from sgl_jax.srt.managers.schedule_batch import (
     global_server_args_dict,
 )
 from sgl_jax.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
+from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool, TTTokenToKVPool
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
@@ -41,8 +42,17 @@ from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.common_utils import get_bool_env_var
 from sgl_jax.srt.utils.jax_utils import get_available_device_memory
+from sgl_jax.srt.utils.tt_weight_dtype import annotate_weight_dtype
 
 logger = logging.getLogger(__name__)
+
+
+def _maybe_annotate_tt_weight_leaf(leaf, dtype: str):
+    if getattr(leaf, "ndim", 0) < 2:
+        return leaf
+    if getattr(leaf, "dtype", None) not in (jnp.bfloat16, jnp.float32):
+        return leaf
+    return annotate_weight_dtype(leaf, dtype)
 
 
 class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
@@ -193,22 +203,58 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         enable_tpu_log_recorder = jax.default_backend() == "tpu" and (
             get_bool_env_var("SGLANG_JAX_ENABLE_KERNEL_LOG_RECORDER")
         )
-        jit_compiler_options = (
-            {"xla_tpu_enable_log_recorder": "true"} if enable_tpu_log_recorder else None
-        )
+        jit_compiler_options = {}
+        tt_decode_compiler_options = None
+        if enable_tpu_log_recorder:
+            jit_compiler_options["xla_tpu_enable_log_recorder"] = "true"
         if enable_tpu_log_recorder:
             logger.info(
                 "Enabling TPU log recorder for JIT compilation "
                 "(compiler_options: xla_tpu_enable_log_recorder=true)."
             )
-
-        @partial(
-            jax.jit,
-            donate_argnames=["memory_pools"],
-            static_argnames=["model_state_def"],
-            compiler_options=jit_compiler_options,
+        experimental_weight_dtype = None
+        if self.server_args.attention_backend == "tt":
+            jit_compiler_options["math_fidelity"] = os.getenv(
+                "SGLANG_TT_MATH_FIDELITY", "hifi4"
+            )
+            jit_compiler_options["fp32_dest_acc_en"] = os.getenv(
+                "SGLANG_TT_FP32_DEST_ACC_EN", "true"
+            )
+            jit_compiler_options["experimental_enable_permute_matmul_fusion"] = os.getenv(
+                "SGLANG_TT_ENABLE_PERMUTE_MATMUL_FUSION", "true"
+            )
+            optimization_level = os.getenv("SGLANG_TT_OPTIMIZATION_LEVEL", "0")
+            if optimization_level != "0":
+                jit_compiler_options["optimization_level"] = optimization_level
+            experimental_weight_dtype = os.getenv("SGLANG_TT_EXPERIMENTAL_WEIGHT_DTYPE")
+            if experimental_weight_dtype:
+                jit_compiler_options["experimental_weight_dtype"] = experimental_weight_dtype
+            experimental_kv_cache_dtype = os.getenv("SGLANG_TT_EXPERIMENTAL_KV_CACHE_DTYPE")
+            if experimental_kv_cache_dtype:
+                jit_compiler_options["experimental-kv-cache-dtype"] = (
+                    experimental_kv_cache_dtype
+                )
+            enable_trace = get_bool_env_var("SGLANG_TT_ENABLE_TRACE", "true")
+            decode_only_trace = get_bool_env_var("SGLANG_TT_TRACE_DECODE_ONLY", "true")
+            if enable_trace and decode_only_trace:
+                tt_decode_compiler_options = {**jit_compiler_options, "enable_trace": "true"}
+            elif enable_trace:
+                jit_compiler_options["enable_trace"] = "true"
+            logger.info("Using TT compiler options for JIT compilation: %s", jit_compiler_options)
+            if tt_decode_compiler_options is not None:
+                logger.info(
+                    "Using TT decode compiler options for JIT compilation: %s",
+                    tt_decode_compiler_options,
+                )
+        if not jit_compiler_options:
+            jit_compiler_options = None
+        tt_weight_dtype = (
+            experimental_weight_dtype
+            if self.server_args.attention_backend == "tt" and experimental_weight_dtype
+            else None
         )
-        def jitted_run_model(
+
+        def run_model_impl(
             model_def,
             model_state_def,
             model_state_leaves,
@@ -216,10 +262,31 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             memory_pools,
             logits_metadata,
         ):
+            if tt_weight_dtype is not None:
+                model_state_leaves = tuple(
+                    _maybe_annotate_tt_weight_leaf(leaf, tt_weight_dtype)
+                    for leaf in model_state_leaves
+                )
             model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, model_state)
             with LoraBatchContext.set_batch(forward_batch):
                 return model(forward_batch, memory_pools, logits_metadata)
+
+        def make_jitted_run_model(compiler_options):
+            jit_model_options = {
+                "static_argnames": ["model_state_def"],
+                "compiler_options": compiler_options,
+            }
+            if self.server_args.attention_backend != "tt":
+                jit_model_options["donate_argnames"] = ["memory_pools"]
+            return jax.jit(run_model_impl, **jit_model_options)
+
+        jitted_run_model = make_jitted_run_model(jit_compiler_options)
+        jitted_decode_run_model = (
+            make_jitted_run_model(tt_decode_compiler_options)
+            if tt_decode_compiler_options is not None
+            else None
+        )
 
         # Capture base RNG key as a constant in the JIT closure.
         # fold_in(constant, dynamic_step) is computed inside JIT, avoiding
@@ -247,8 +314,18 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         def jitted_compute_logprobs(mesh, logits, next_tokens):
             return compute_logprobs(mesh, logits, next_tokens)
 
+        @jax.jit
+        def jitted_greedy_sampler(logits_output):
+            return jnp.argmax(logits_output.next_token_logits, axis=-1).flatten()
+
         def run_model_wrapper(forward_batch, logits_metadata):
-            return jitted_run_model(
+            run_model = (
+                jitted_decode_run_model
+                if jitted_decode_run_model is not None
+                and forward_batch.forward_mode.is_decode()
+                else jitted_run_model
+            )
+            return run_model(
                 model_def,
                 model_state_def,
                 self.model_state_leaves,
@@ -268,6 +345,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         )
 
         self.jitted_compute_logprobs = partial(jitted_compute_logprobs, self.mesh)
+        self.jitted_greedy_sampler = jitted_greedy_sampler
 
     def get_available_device_memory(self):
         distributed = jax.process_count() != 1
@@ -465,6 +543,17 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 mesh=self.mesh,
             )
 
+        elif backend == "tt":
+            from sgl_jax.srt.layers.attention.tt_backend import TTSDPAAttention
+
+            full_attn_backend = TTSDPAAttention(
+                self.num_attn_heads,
+                self.num_kv_heads,
+                self.model_config.head_dim,
+                page_size=self.page_size,
+                mesh=self.mesh,
+            )
+
         else:
             raise ValueError(f"Unsupported attention backend: {self.server_args.attention_backend}")
 
@@ -489,15 +578,38 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             )
             cache_miss_count = count()
 
-        # tp_size==1: sharding constraint is lost after JIT; re-place explicitly.
-        # See https://github.com/sgl-project/sglang-jax/issues/233
-        if self.tp_size == 1 and isinstance(pool_updates, list):
-            target_sharding = self.token_to_kv_pool.kv_sharding
-            pool_updates = [jax.device_put(kv, target_sharding) for kv in pool_updates]
-        self.memory_pools.replace_all(pool_updates)
+        self._replace_pool_updates(pool_updates)
 
         # layers_topk_ids required real_bs and original_input_len which could not be stored in ForwardBatch
         return output, cache_miss_count, layers_topk_ids
+
+    def _replace_pool_updates(self, pool_updates):
+        if pool_updates is None:
+            return
+
+        # tp_size==1: sharding constraint is lost after JIT; re-place explicitly.
+        # See https://github.com/sgl-project/sglang-jax/issues/233
+        if self.tp_size == 1 and self.server_args.attention_backend != "tt":
+            target_sharding = self.token_to_kv_pool.kv_sharding
+
+            def place_kv_updates(kv_updates):
+                return [
+                    tuple(jax.device_put(part, target_sharding) for part in kv)
+                    if isinstance(kv, tuple)
+                    else jax.device_put(kv, target_sharding)
+                    for kv in kv_updates
+                ]
+
+            if isinstance(pool_updates, list):
+                pool_updates = place_kv_updates(pool_updates)
+            elif isinstance(pool_updates, dict) and isinstance(
+                pool_updates.get("token_to_kv_pool"), list
+            ):
+                pool_updates = {
+                    **pool_updates,
+                    "token_to_kv_pool": place_kv_updates(pool_updates["token_to_kv_pool"]),
+                }
+        self.memory_pools.replace_all(pool_updates)
 
     def forward_idle(
         self,
@@ -565,6 +677,9 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             logits_output,
             sampling_metadata,
         )
+
+    def greedy_sample(self, logits_output: LogitsProcessorOutput) -> tuple[jax.Array, None, None]:
+        return self.jitted_greedy_sampler(logits_output), None, None
 
     def compute_logprobs(self, logits, token_ids: jax.Array) -> jax.Array:
         return self.jitted_compute_logprobs(logits, token_ids)
@@ -726,7 +841,12 @@ class MockModelRunner(ModelRunner):
             dtype=np.int32,
         )
 
-        self.token_to_kv_pool = MHATokenToKVPool(
+        kv_pool_class = (
+            TTTokenToKVPool
+            if self.server_args.attention_backend == "tt"
+            else MHATokenToKVPool
+        )
+        self.token_to_kv_pool = kv_pool_class(
             size=self.max_total_num_tokens,
             page_size=self.page_size,
             dtype=self.kv_cache_dtype,

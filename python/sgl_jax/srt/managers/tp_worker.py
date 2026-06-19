@@ -31,6 +31,27 @@ from sgl_jax.utils import get_exception_traceback
 logger = logging.getLogger(__name__)
 
 
+def _can_use_fast_greedy_sampler(
+    batch: ModelWorkerBatch,
+    sampling_metadata: SamplingMetadata,
+) -> bool:
+    return (
+        sampling_metadata.is_all_greedy
+        and not sampling_metadata.do_penalties
+        and not sampling_metadata.apply_vocab_mask
+        and not batch.return_logprob
+        and not batch.return_output_logprob_only
+    )
+
+
+def _use_tt_trace_cpu_greedy_sampler(server_args: ServerArgs) -> bool:
+    if server_args.attention_backend != "tt":
+        return False
+    if os.getenv("SGLANG_TT_ENABLE_TRACE", "true").lower() not in ("1", "true"):
+        return False
+    return os.getenv("SGLANG_TT_CPU_SAMPLING", "0").lower() in ("1", "true")
+
+
 def _iter_padded_input_logprob_reqs(model_worker_batch, padded_rows: int):
     """Yield (slot, row_offset, pruned_len) per req, in DP-rank-then-req order.
 
@@ -453,10 +474,33 @@ class ModelWorker:
                 self._update_grammar_vocab_mask(model_worker_batch, sampling_metadata)
 
             with jtu.count_pjit_cpp_cache_miss() as count:
-                next_token_ids_device, token_logprobs, new_logits_output = self.model_runner.sample(
-                    logits_output,
-                    sampling_metadata,
-                )
+                if (
+                    _can_use_fast_greedy_sampler(model_worker_batch, sampling_metadata)
+                    and _use_tt_trace_cpu_greedy_sampler(self.server_args)
+                ):
+                    next_token_ids_device = np.argmax(
+                        np.asarray(
+                            jax.device_get(
+                                logits_output.next_token_logits[
+                                    : model_worker_batch.real_bs, :
+                                ]
+                            )
+                        ),
+                        axis=-1,
+                    ).astype(np.int32)
+                    token_logprobs = None
+                    new_logits_output = None
+                elif _can_use_fast_greedy_sampler(model_worker_batch, sampling_metadata):
+                    next_token_ids_device, token_logprobs, new_logits_output = (
+                        self.model_runner.greedy_sample(logits_output)
+                    )
+                else:
+                    next_token_ids_device, token_logprobs, new_logits_output = (
+                        self.model_runner.sample(
+                            logits_output,
+                            sampling_metadata,
+                        )
+                    )
                 cache_miss_count += count()
             # `selector` reorders DP-interleaved per-req tensors back to
             # original request order. For DP=1 it's just np.arange(real_bs).

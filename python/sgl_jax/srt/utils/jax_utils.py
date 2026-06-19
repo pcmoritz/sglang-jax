@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import gc
+import os
 from collections import defaultdict
 from typing import Any
 
@@ -131,8 +132,8 @@ def get_available_device_memory(
             selected_devices = device_list
         return selected_devices
 
-    if device == "tpu":
-        raw_devices = jax.local_devices()
+    if device in ("tpu", "tt"):
+        raw_devices = jax.local_devices(backend=device) if device == "tt" else jax.local_devices()
         devices = filter_devices(raw_devices, device_indexes)
         if empty_cache:
             gc.collect()  # collect garbage to free up memory used by quantization
@@ -142,7 +143,10 @@ def get_available_device_memory(
         avail_mem = []
         for dev in devices:
             stats = dev.memory_stats()
-            avail_mem.append(stats["bytes_limit"] - stats["bytes_in_use"])
+            bytes_limit = stats.get("bytes_limit")
+            if bytes_limit is None and device == "tt":
+                bytes_limit = int(float(os.environ.get("SGLANG_TT_MEMORY_LIMIT_GB", "32")) * GBYTES)
+            avail_mem.append(bytes_limit - stats["bytes_in_use"])
         avail_mem = jnp.array([min(avail_mem) / (1 << 10)], dtype=jnp.float32)
     elif "proxy" in device:
         raw_devices = jax.devices()

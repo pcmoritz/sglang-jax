@@ -629,6 +629,229 @@ class MHATokenToKVPool(KVCache):
 
 
 @register_pytree_node_class
+class TTTokenToKVPool(KVCache):
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: jnp.dtype,
+        head_num: int,
+        head_dim: int,
+        layer_num: int,
+        mesh: Mesh,
+        dp_size: int = 1,
+        start_layer: int | None = None,
+        end_layer: int | None = None,
+    ):
+        super().__init__(size, page_size, dtype, layer_num, mesh, start_layer, end_layer)
+        self.head_num = head_num
+        self.head_dim = head_dim
+        self.dp_size = dp_size
+        self.kv_partition_axis = "tensor"
+        self.attention_data_partition_axis = "data"
+
+        self._create_buffers()
+        self._calculate_memory_usage()
+
+    def tree_flatten(self):
+        parent_children, parent_aux_data = super().tree_flatten()
+        children = (self.kv_buffer,) + parent_children
+        aux_data = {
+            **parent_aux_data,
+            "head_num": self.head_num,
+            "head_dim": self.head_dim,
+            "dp_size": self.dp_size,
+            "kv_partition_axis": self.kv_partition_axis,
+            "attention_data_partition_axis": self.attention_data_partition_axis,
+            "kv_sharding": self.kv_sharding,
+        }
+        return (children, aux_data)
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        kv_buffer = children[0]
+        parent_children = children[1:] if len(children) > 1 else ()
+
+        obj = object.__new__(cls)
+        parent_obj = super().tree_unflatten(aux_data, parent_children)
+        for attr in [
+            "size",
+            "page_size",
+            "dtype",
+            "layer_num",
+            "mesh",
+            "start_layer",
+            "end_layer",
+            "mem_usage",
+        ]:
+            setattr(obj, attr, getattr(parent_obj, attr))
+
+        obj.head_num = aux_data["head_num"]
+        obj.head_dim = aux_data["head_dim"]
+        obj.dp_size = aux_data.get("dp_size", 1)
+        obj.kv_partition_axis = aux_data["kv_partition_axis"]
+        obj.attention_data_partition_axis = aux_data.get("attention_data_partition_axis", "data")
+        obj.kv_sharding = aux_data["kv_sharding"]
+        obj.kv_buffer = kv_buffer
+        return obj
+
+    def _create_buffers(self):
+        self.kv_sharding = NamedSharding(
+            self.mesh,
+            P(self.attention_data_partition_axis, self.kv_partition_axis, None, None),
+        )
+
+        logger.info("Creating TT paged KV buffers for %s layers", self.layer_num)
+        start_time = time.time()
+
+        assert (
+            self.size % self.dp_size == 0 and self.size % self.page_size == 0
+        ), "Cache size must be divisible by dp_size and size must be divisible by page size"
+
+        cache_shape = (
+            (self.size + self.page_size * self.dp_size) // self.page_size,
+            self.head_num,
+            self.page_size,
+            self.head_dim,
+        )
+        host_zero = np.zeros(cache_shape, dtype=np.dtype(self.dtype))
+
+        def make_buffer():
+            return jax.device_put(host_zero.copy(), self.kv_sharding)
+
+        with self.mesh:
+            self.kv_buffer = [(make_buffer(), make_buffer()) for _ in range(self.layer_num)]
+
+        logger.info(
+            "Total time to create %s TT KV buffers: %.2f seconds",
+            self.layer_num,
+            time.time() - start_time,
+        )
+
+    def _calculate_memory_usage(self):
+        kv_size = (
+            (self.size + self.page_size * self.dp_size)
+            * self.head_num
+            * self.head_dim
+            * 2
+            * jnp.dtype(self.dtype).itemsize
+            * self.layer_num
+        )
+        self.mem_usage = kv_size / GB
+        logger.info(
+            "TT KV Cache allocated. #tokens: %s, KV size: %.2f GB",
+            self.size,
+            self.mem_usage,
+        )
+
+    def get_kv_size_bytes(self):
+        one_cache = (
+            (self.size + self.page_size * self.dp_size)
+            * self.head_num
+            * self.head_dim
+            * jnp.dtype(self.dtype).itemsize
+            * self.layer_num
+        )
+        return one_cache, one_cache
+
+    def get_fused_kv_buffer(self, layer_id: int):
+        return self.get_kv_buffer(layer_id)
+
+    def get_kv_buffer(self, layer_id: int) -> tuple[jax.Array, jax.Array]:
+        return self.kv_buffer[layer_id - self.start_layer]
+
+    def _pad_head_dim(self, value: jax.Array) -> jax.Array:
+        if value.shape[-1] == self.head_dim:
+            return value
+        if value.shape[-1] > self.head_dim:
+            return value[..., : self.head_dim]
+        return jnp.pad(value, ((0, 0), (0, 0), (0, self.head_dim - value.shape[-1])))
+
+    def _scatter_flat_tokens(
+        self,
+        cache: jax.Array,
+        loc: jax.Array,
+        value: jax.Array,
+    ) -> jax.Array:
+        num_pages, head_num, page_size, head_dim = cache.shape
+        total_tokens = num_pages * page_size
+        cache_3d = jax.lax.reshape(
+            jnp.transpose(cache, (0, 2, 1, 3)),
+            (total_tokens, head_num, head_dim),
+            out_sharding=P(None, self.kv_partition_axis, None),
+        )
+        safe_loc = jnp.where(loc >= 0, loc, jnp.int32(total_tokens))
+        updated_3d = cache_3d.at[safe_loc].set(
+            self._pad_head_dim(value),
+            mode="drop",
+            out_sharding=P(None, self.kv_partition_axis, None),
+        )
+        updated_4d = jax.lax.reshape(
+            updated_3d,
+            (num_pages, page_size, head_num, head_dim),
+            out_sharding=P(self.attention_data_partition_axis, None, self.kv_partition_axis, None),
+        )
+        return jnp.transpose(updated_4d, (0, 2, 1, 3))
+
+    def set_kv_buffer(
+        self,
+        layer_id: int,
+        loc: jax.Array,
+        k: jax.Array,
+        v: jax.Array,
+        is_decode: bool = False,
+    ) -> None:
+        del is_decode
+        layer_idx = layer_id - self.start_layer
+        k_cache, v_cache = self.kv_buffer[layer_idx]
+        self.kv_buffer[layer_idx] = (
+            self._scatter_flat_tokens(k_cache, loc, k),
+            self._scatter_flat_tokens(v_cache, loc, v),
+        )
+
+    def set_kv_buffer_legacy(
+        self,
+        layer_id: int,
+        loc: jax.Array,
+        k: jax.Array,
+        v: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        self.set_kv_buffer(layer_id, loc, k, v)
+        return self.get_kv_buffer(layer_id)
+
+    def replace_buffer(self, kv_buffer: list[tuple[jax.Array, jax.Array]]) -> None:
+        self.kv_buffer[self.start_layer : self.start_layer + len(kv_buffer)] = kv_buffer
+
+    def get_cpu_copy(self, indices):
+        kv_cache_host = []
+        for layer_id in range(self.layer_num):
+            k_cache, v_cache = self.kv_buffer[layer_id]
+            kv_cache_host.append(
+                [jax.device_get(k_cache[indices]), jax.device_get(v_cache[indices])]
+            )
+        return kv_cache_host
+
+    def load_cpu_copy(self, kv_cache_host, indices):
+        for layer_id in range(self.layer_num):
+            k_host, v_host = kv_cache_host[layer_id]
+            k_device = jax.device_put(k_host, self.kv_sharding)
+            v_device = jax.device_put(v_host, self.kv_sharding)
+            k_cache, v_cache = self.kv_buffer[layer_id]
+            self.kv_buffer[layer_id] = (
+                k_cache.at[indices].set(k_device),
+                v_cache.at[indices].set(v_device),
+            )
+
+    def clear_cache(self, indices: jax.Array):
+        for layer_id in range(self.layer_num):
+            k_cache, v_cache = self.kv_buffer[layer_id]
+            self.kv_buffer[layer_id] = (
+                k_cache.at[indices].set(0),
+                v_cache.at[indices].set(0),
+            )
+
+
+@register_pytree_node_class
 class SWAKVPool(KVCache):
     """KV cache with separate pools for full and SWA attention layers."""
 

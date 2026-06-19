@@ -62,6 +62,10 @@ def _reinterpret_dtype_if_needed(data: np.ndarray, target_dtype: jnp.dtype) -> n
     return data
 
 
+def _tt_host_weight_load_enabled() -> bool:
+    return os.environ.get("SGLANG_TT_HOST_WEIGHT_LOAD") == "1"
+
+
 @dataclass
 class WeightMapping:
     target_path: str | list[str]
@@ -1118,6 +1122,13 @@ class WeightLoader:
 
             filename = info["file"]
 
+            if _tt_host_weight_load_enabled() and target_sharding is None:
+                f = file_manager.get_handle(filename)
+                data = f.get_tensor(hf_key)
+                data = _reinterpret_dtype_if_needed(data, target_dtype)
+                lazy_arrays.append(jnp.asarray(data, dtype=target_dtype))
+                continue
+
             if target_sharding is not None:
                 # Load only what this host needs (Global Loading)
                 sharding = target_sharding
@@ -1919,6 +1930,7 @@ class WeightLoader:
                     and not mapping.head_dim_padding
                     and mapping.sharding is not None
                     and hf_key != "d2t"
+                    and not _tt_host_weight_load_enabled()
                 )
 
                 if can_optimize:
