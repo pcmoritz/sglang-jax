@@ -264,8 +264,9 @@ class ServerArgs:
         # update device
         if self.device:
             platform_env = os.environ.get("JAX_PLATFORMS", self.device)
+            platform_names = [name.strip() for name in platform_env.split(",")]
             assert (
-                self.device == platform_env
+                self.device in platform_names
             ), f"device {self.device} is not consistent with 'JAX_PLATFORMS' {platform_env}"
         else:
             platform_env = os.environ.get("JAX_PLATFORMS", "")
@@ -1091,6 +1092,7 @@ class ServerArgs:
                 "native",
                 "fa",
                 "fa_mha",
+                "tt",
             ],
             default=ServerArgs.attention_backend,
             help=(
@@ -1098,7 +1100,8 @@ class ServerArgs:
                 "'fa' = FlashAttention for MHA models, MLA Pallas kernel (absorbed) for MLA models. "
                 "'fa_mha' = force the MHA FlashAttention path for MLA models too "
                 "(decompress latent KV per-forward via kv_b_proj; ~70x more KV cache than 'fa', "
-                "intended for kernel A/B on short contexts)."
+                "intended for kernel A/B on short contexts). "
+                "'tt' = TTNN paged SDPA decode with native fallback for non-decode."
             ),
         )
         parser.add_argument(

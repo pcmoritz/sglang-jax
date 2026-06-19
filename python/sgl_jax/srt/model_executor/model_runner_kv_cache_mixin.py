@@ -458,9 +458,15 @@ class ModelRunnerKVCacheMixin:
             MHATokenToKVPool,
             ReqToTokenPool,
             SWAKVPool,
+            TTTokenToKVPool,
         )
 
         has_recurrent_state = self.linear_recurrent_config is not None
+        mha_pool_class = (
+            TTTokenToKVPool
+            if self.server_args.attention_backend == "tt"
+            else MHATokenToKVPool
+        )
 
         # --- ReqToTokenPool (non-hybrid only; hybrid defers to after KV pool) ---
         if self.req_to_token_pool is None and not has_recurrent_state:
@@ -492,7 +498,7 @@ class ModelRunnerKVCacheMixin:
                 page_size=self.page_size,
                 swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
                 full_attention_layer_ids=self.model_config.full_attention_layer_ids,
-                token_to_kv_pool_class=MHATokenToKVPool,
+                token_to_kv_pool_class=mha_pool_class,
                 dtype=self.kv_cache_dtype,
                 head_num=full_head_num,
                 head_dim=(full_head_dim + 127) // 128 * 128,
@@ -522,7 +528,7 @@ class ModelRunnerKVCacheMixin:
             )
         else:
             self.token_to_kv_pool = self._maybe_wrap_hybrid_kv_pool(
-                MHATokenToKVPool,
+                mha_pool_class,
                 head_num=self.model_config.get_total_num_kv_heads_with_replication(
                     self.attention_tp_size
                 ),

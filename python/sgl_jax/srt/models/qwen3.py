@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Any
 
 import jax
@@ -351,7 +352,13 @@ class QWen3Model(nnx.Module):
     ):
         residual = None
         hidden_states = self.embed_tokens(forward_batch.input_ids)
-        layers_kv_fused = []
+
+        skip_kv_pool_update = (
+            forward_batch.forward_mode.is_decode()
+            and getattr(forward_batch.attn_backend, "updates_kv_cache_in_place", False)
+            and os.environ.get("SGLANG_TT_KEEP_CACHE_OUTPUTS") != "1"
+        )
+        layers_kv_fused = None if skip_kv_pool_update else []
         layers_callback_flag = []
         aux_hidden_states = []
         for layer_id, layer in enumerate(self.layers):
@@ -366,7 +373,8 @@ class QWen3Model(nnx.Module):
                 token_to_kv_pool,
                 residual,
             )
-            layers_kv_fused.append(kv_fused)
+            if layers_kv_fused is not None:
+                layers_kv_fused.append(kv_fused)
             layers_callback_flag.extend(callback_flag)
 
         if residual is not None:
@@ -581,9 +589,12 @@ class Qwen3ForCausalLM(nnx.Module):
         logits_metadata: LogitsMetadata,
     ):
         kv_pool = memory_pools.token_to_kv_pool
-        hidden_states, aux_hidden_states, layers_kv_fused, layers_callback_flag = self.model(
-            forward_batch, kv_pool
-        )
+        (
+            hidden_states,
+            aux_hidden_states,
+            layers_kv_fused,
+            layers_callback_flag,
+        ) = self.model(forward_batch, kv_pool)
         if not getattr(self.config, "tie_word_embeddings", False):
             output = self.logits_processor(
                 hidden_states, self.lm_head, logits_metadata, aux_hidden_states=aux_hidden_states
@@ -596,7 +607,10 @@ class Qwen3ForCausalLM(nnx.Module):
                 aux_hidden_states=aux_hidden_states,
             )
 
-        return output, {"token_to_kv_pool": layers_kv_fused}, layers_callback_flag, None
+        pool_updates = (
+            None if layers_kv_fused is None else {"token_to_kv_pool": layers_kv_fused}
+        )
+        return output, pool_updates, layers_callback_flag, None
 
 
 EntryClass = Qwen3ForCausalLM
