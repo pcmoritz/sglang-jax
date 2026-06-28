@@ -96,6 +96,10 @@ def _tt_block_size(page_size: int) -> int:
     return max(32, ((page_size + 31) // 32) * 32)
 
 
+def _decode_min_users() -> int:
+    return max(1, int(os.environ.get("SGLANG_TT_DECODE_MIN_USERS", "8")))
+
+
 def _pad_page_table(table: jax.Array, min_users: int = 8, min_blocks: int = 16) -> jax.Array:
     pad_users = max(0, min_users - table.shape[0])
     pad_blocks = max(0, min_blocks - table.shape[1])
@@ -167,7 +171,7 @@ class TTSDPAAttention(AttentionBackend):
         seq_lens = self._active_decode_seq_lens(batch)
         cache_loc = np.asarray(batch.cache_loc, dtype=np.int32)
         per_dp_bs = max(max(batch.real_bs_per_dp), 1)
-        decode_users = max(8, len(batch.input_ids))
+        decode_users = max(_decode_min_users(), len(batch.input_ids))
         page_table = _decode_page_table(
             cache_loc,
             seq_lens,
@@ -629,7 +633,7 @@ class TTSDPAAttention(AttentionBackend):
         page_table: jax.Array,
         cur_pos: jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        target_users = max(q.shape[1], 8)
+        target_users = max(q.shape[1], _decode_min_users())
         if page_table.shape[0] > target_users:
             page_table = page_table[:target_users]
         if cur_pos.shape[0] > target_users:
