@@ -238,6 +238,12 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             decode_only_trace = get_bool_env_var("SGLANG_TT_TRACE_DECODE_ONLY", "true")
             if enable_trace and decode_only_trace:
                 tt_decode_compiler_options = {**jit_compiler_options, "enable_trace": "true"}
+                decode_optimization_level = os.getenv("SGLANG_TT_DECODE_OPTIMIZATION_LEVEL")
+                if decode_optimization_level is not None:
+                    if decode_optimization_level == "0":
+                        tt_decode_compiler_options.pop("optimization_level", None)
+                    else:
+                        tt_decode_compiler_options["optimization_level"] = decode_optimization_level
             elif enable_trace:
                 jit_compiler_options["enable_trace"] = "true"
             logger.info("Using TT compiler options for JIT compilation: %s", jit_compiler_options)

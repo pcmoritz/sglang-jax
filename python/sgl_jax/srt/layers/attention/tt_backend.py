@@ -97,7 +97,7 @@ def _tt_block_size(page_size: int) -> int:
 
 
 def _decode_min_users() -> int:
-    return max(1, int(os.environ.get("SGLANG_TT_DECODE_MIN_USERS", "8")))
+    return max(1, int(os.environ.get("SGLANG_TT_DECODE_MIN_USERS", "1")))
 
 
 def _pad_page_table(table: jax.Array, min_users: int = 8, min_blocks: int = 16) -> jax.Array:
