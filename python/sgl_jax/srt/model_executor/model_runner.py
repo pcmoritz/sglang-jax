@@ -42,17 +42,16 @@ from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.common_utils import get_bool_env_var
 from sgl_jax.srt.utils.jax_utils import get_available_device_memory
-from sgl_jax.srt.utils.tt_weight_dtype import annotate_weight_dtype
+from sgl_jax.srt.utils.tt_weight_dtype import annotate_weight_dtype, mark_parameter
 
 logger = logging.getLogger(__name__)
 
 
 def _maybe_annotate_tt_weight_leaf(leaf, dtype: str):
-    if getattr(leaf, "ndim", 0) < 2:
+    ndim = getattr(leaf, "ndim", 0)
+    if ndim == 0 or getattr(leaf, "dtype", None) not in (jnp.bfloat16, jnp.float32):
         return leaf
-    if getattr(leaf, "dtype", None) not in (jnp.bfloat16, jnp.float32):
-        return leaf
-    return annotate_weight_dtype(leaf, dtype)
+    return mark_parameter(leaf) if ndim == 1 else annotate_weight_dtype(leaf, dtype)
 
 
 class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):

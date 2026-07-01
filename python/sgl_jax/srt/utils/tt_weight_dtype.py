@@ -14,6 +14,10 @@ _tt_weight_dtype_override_p = core.Primitive("tt_weight_dtype_override")
 _VALID_WEIGHT_DTYPES = {"bfp_bf4", "bfp_bf8", "bf16"}
 
 
+def mark_parameter(tensor):
+    return _tt_mark_parameter_p.bind(tensor)
+
+
 def annotate_weight_dtype(tensor, dtype: str):
     if dtype not in _VALID_WEIGHT_DTYPES:
         raise ValueError(
@@ -24,7 +28,7 @@ def annotate_weight_dtype(tensor, dtype: str):
     if tensor.ndim < 3:
         tensor = jnp.reshape(tensor, (1,) * (3 - tensor.ndim) + original_shape)
 
-    tensor = _tt_mark_parameter_p.bind(tensor)
+    tensor = mark_parameter(tensor)
     tensor = _tt_weight_dtype_override_p.bind(tensor, dtype=dtype)
 
     if len(original_shape) < 3:
