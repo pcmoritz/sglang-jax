@@ -193,22 +193,20 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         enable_tpu_log_recorder = jax.default_backend() == "tpu" and (
             get_bool_env_var("SGLANG_JAX_ENABLE_KERNEL_LOG_RECORDER")
         )
-        jit_compiler_options = (
-            {"xla_tpu_enable_log_recorder": "true"} if enable_tpu_log_recorder else None
+        jit_compiler_options = dict(
+            getattr(self.attn_backend, "compiler_options", {})
         )
+        if enable_tpu_log_recorder:
+            jit_compiler_options["xla_tpu_enable_log_recorder"] = "true"
         if enable_tpu_log_recorder:
             logger.info(
                 "Enabling TPU log recorder for JIT compilation "
                 "(compiler_options: xla_tpu_enable_log_recorder=true)."
             )
+        if not jit_compiler_options:
+            jit_compiler_options = None
 
-        @partial(
-            jax.jit,
-            donate_argnames=["memory_pools"],
-            static_argnames=["model_state_def"],
-            compiler_options=jit_compiler_options,
-        )
-        def jitted_run_model(
+        def run_model(
             model_def,
             model_state_def,
             model_state_leaves,
@@ -216,10 +214,26 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             memory_pools,
             logits_metadata,
         ):
+            prepare_model_state = getattr(
+                self.attn_backend, "prepare_model_state", None
+            )
+            if prepare_model_state is not None:
+                model_state_leaves = prepare_model_state(model_state_leaves)
             model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, model_state)
             with LoraBatchContext.set_batch(forward_batch):
                 return model(forward_batch, memory_pools, logits_metadata)
+
+        jitted_run_model = jax.jit(
+            run_model,
+            donate_argnames=(
+                []
+                if getattr(self.attn_backend, "updates_cache_in_place", False)
+                else ["memory_pools"]
+            ),
+            static_argnames=["model_state_def"],
+            compiler_options=jit_compiler_options,
+        )
 
         # Capture base RNG key as a constant in the JIT closure.
         # fold_in(constant, dynamic_step) is computed inside JIT, avoiding
@@ -247,6 +261,10 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         def jitted_compute_logprobs(mesh, logits, next_tokens):
             return compute_logprobs(mesh, logits, next_tokens)
 
+        @jax.jit
+        def jitted_greedy_sampler(logits_output):
+            return jnp.argmax(logits_output.next_token_logits, axis=-1).flatten()
+
         def run_model_wrapper(forward_batch, logits_metadata):
             return jitted_run_model(
                 model_def,
@@ -268,6 +286,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         )
 
         self.jitted_compute_logprobs = partial(jitted_compute_logprobs, self.mesh)
+        self.jitted_greedy_sampler = jitted_greedy_sampler
 
     def get_available_device_memory(self):
         distributed = jax.process_count() != 1
@@ -465,6 +484,17 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 mesh=self.mesh,
             )
 
+        elif backend == "tt":
+            from sgl_jax.srt.layers.attention.tt_backend import TTAttention
+
+            full_attn_backend = TTAttention(
+                self.num_attn_heads,
+                self.num_kv_heads,
+                self.model_config.head_dim,
+                page_size=self.page_size,
+                mesh=self.mesh,
+            )
+
         else:
             raise ValueError(f"Unsupported attention backend: {self.server_args.attention_backend}")
 
@@ -568,6 +598,9 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
     def compute_logprobs(self, logits, token_ids: jax.Array) -> jax.Array:
         return self.jitted_compute_logprobs(logits, token_ids)
+
+    def greedy_sample(self, logits_output: LogitsProcessorOutput):
+        return self.jitted_greedy_sampler(logits_output), None, None
 
     def set_num_token_hybrid(self):
         assert self.sliding_window_size is not None and self.sliding_window_size > 0
