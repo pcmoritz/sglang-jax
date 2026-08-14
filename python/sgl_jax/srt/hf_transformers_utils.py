@@ -23,7 +23,7 @@ from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_N
 from sgl_jax.srt.configs.bailing_hybrid import BailingHybridConfig
 from sgl_jax.srt.configs.gemma4 import Gemma4Config
 from sgl_jax.srt.configs.kimi_linear import KimiLinearConfig
-from sgl_jax.srt.configs.qwen3_5 import Qwen3_5HybridConfig
+from sgl_jax.srt.configs.qwen3_5 import Qwen3_5Config, Qwen3_5HybridConfig
 from sgl_jax.srt.managers.tiktoken_tokenizer import TiktokenTokenizer
 from sgl_jax.srt.utils.common_utils import is_remote_url, lru_cache_frozenset
 
@@ -42,6 +42,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
         BailingHybridConfig,
         KimiLinearConfig,
         GlmMoeDsaConfig,
+        Qwen3_5Config,
         Qwen3_5HybridConfig,
         Gemma4Config,
     ]
@@ -53,9 +54,10 @@ for name, cls in _CONFIG_REGISTRY.items():
     with contextlib.suppress(ValueError):
         AutoConfig.register(name, cls)
 
-# Qwen3.5 is the exception: stock transformers >=5.3 owns ``qwen3_5_moe`` so the
-# loop skips ours, but ours isn't interchangeable (flattens rope_parameters +
-# exposes the hybrid/GDN interface the runner needs). Force ours to win.
+# Qwen3.5 is the exception: recent transformers versions own these config
+# names, but the local configs also flatten rope_parameters and expose the
+# hybrid/GDN interface used by the runner. Force the local adapters to win.
+AutoConfig.register("qwen3_5", Qwen3_5Config, exist_ok=True)
 AutoConfig.register("qwen3_5_moe", Qwen3_5HybridConfig, exist_ok=True)
 
 

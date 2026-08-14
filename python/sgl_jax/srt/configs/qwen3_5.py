@@ -23,7 +23,11 @@ from typing import Any
 
 from transformers.configuration_utils import PretrainedConfig
 
-__all__ = ["Qwen3_5HybridConfig", "get_qwen3_5_hybrid_config"]
+__all__ = [
+    "Qwen3_5Config",
+    "Qwen3_5HybridConfig",
+    "get_qwen3_5_hybrid_config",
+]
 
 
 class _Qwen3_5TextConfig(PretrainedConfig):
@@ -47,6 +51,7 @@ class _Qwen3_5TextConfig(PretrainedConfig):
         num_key_value_heads: int = 2,
         head_dim: int = 256,
         hidden_act: str = "silu",
+        intermediate_size: int | None = None,
         max_position_embeddings: int = 262144,
         initializer_range: float = 0.02,
         rms_norm_eps: float = 1e-6,
@@ -85,6 +90,7 @@ class _Qwen3_5TextConfig(PretrainedConfig):
         self.num_key_value_heads = num_key_value_heads
         self.head_dim = head_dim
         self.hidden_act = hidden_act
+        self.intermediate_size = intermediate_size
         self.max_position_embeddings = max_position_embeddings
         self.initializer_range = initializer_range
         self.rms_norm_eps = rms_norm_eps
@@ -216,7 +222,7 @@ class Qwen3_5HybridConfig(PretrainedConfig):
         if text_config is None:
             text_config = {}
         if isinstance(text_config, dict):
-            text_config = _Qwen3_5TextConfig(**text_config)
+            text_config = self.sub_configs["text_config"](**text_config)
         self.text_config = text_config
 
         # Keep vision_config as a plain dict — base inference path doesn't
@@ -230,6 +236,62 @@ class Qwen3_5HybridConfig(PretrainedConfig):
 
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
+        # Transformers 5.x normalizes declared sub-configs while initializing
+        # the root config. Keep the local text adapter, which also exposes the
+        # hybrid-attention properties consumed by sgl-jax.
+        self.text_config = text_config
+
+
+class _Qwen3_5DenseTextConfig(_Qwen3_5TextConfig):
+    """Text config used by dense Qwen3.5 checkpoints such as 9B."""
+
+    model_type = "qwen3_5_text"
+
+    def __init__(self, intermediate_size: int = 12288, **kwargs):
+        # Dense checkpoints do not carry the MoE fields. Set num_experts to
+        # zero so the shared model implementation selects the SwiGLU MLP.
+        kwargs.pop("num_experts", None)
+        kwargs.pop("num_experts_per_tok", None)
+        super().__init__(
+            intermediate_size=intermediate_size,
+            num_experts=0,
+            num_experts_per_tok=0,
+            **kwargs,
+        )
+
+
+class Qwen3_5Config(Qwen3_5HybridConfig):
+    """Root config for dense Qwen3.5 checkpoints."""
+
+    model_type = "qwen3_5"
+    sub_configs = {"text_config": _Qwen3_5DenseTextConfig}
+    moe_pre_fused = False
+
+    def __init__(
+        self,
+        text_config: dict | None = None,
+        vision_config: dict | None = None,
+        image_token_id: int = 248056,
+        video_token_id: int = 248057,
+        vision_start_token_id: int = 248053,
+        vision_end_token_id: int = 248054,
+        tie_word_embeddings: bool = False,
+        **kwargs,
+    ):
+        # Keep an explicit constructor: recent transformers versions derive
+        # config fields from subclass signatures and would otherwise treat the
+        # nested text config as an untyped dictionary.
+        super().__init__(
+            text_config=text_config,
+            vision_config=vision_config,
+            image_token_id=image_token_id,
+            video_token_id=video_token_id,
+            vision_start_token_id=vision_start_token_id,
+            vision_end_token_id=vision_end_token_id,
+            tie_word_embeddings=tie_word_embeddings,
+            **kwargs,
+        )
+
 
 def get_qwen3_5_hybrid_config(hf_config: Any) -> Qwen3_5HybridConfig | None:
     """Return the hf_config cast to ``Qwen3_5HybridConfig``, else ``None``.
@@ -237,6 +299,6 @@ def get_qwen3_5_hybrid_config(hf_config: Any) -> Qwen3_5HybridConfig | None:
     Mirrors ``get_kimi_linear_config`` / ``get_bailing_hybrid_config`` so
     the runner can dispatch via duck-typing.
     """
-    if getattr(hf_config, "model_type", None) == "qwen3_5_moe":
+    if getattr(hf_config, "model_type", None) in {"qwen3_5", "qwen3_5_moe"}:
         return hf_config
     return None

@@ -1,4 +1,4 @@
-"""Qwen3.5-35B-A3B hybrid-attention MoE (text-only for M1).
+"""Qwen3.5 hybrid-attention models (text-only for M1).
 
 Layer layout (40 total, ``full_attention_interval=4``): full-attention at
 indices 3, 7, ..., 39 (10 layers); Gated DeltaNet (GDN linear attention) at
@@ -48,9 +48,14 @@ from sgl_jax.srt.layers.radix_linear_attention import RadixLinearAttention
 from sgl_jax.srt.mem_cache.memory_pool import MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.models.qwen2_moe import Qwen2MoeMLP
+from sgl_jax.srt.models.qwen3 import Qwen3MLP
 from sgl_jax.srt.utils.weight_utils import WeightMapping
 
 logger = logging.getLogger(__name__)
+
+
+def _is_moe_config(config: PretrainedConfig) -> bool:
+    return int(getattr(config.text_config, "num_experts", 0) or 0) > 0
 
 
 # =============================================================================
@@ -424,13 +429,23 @@ class Qwen3_5DecoderLayer(nnx.Module):
     ):
         text_cfg = config.text_config
         self.is_full_attn = layer_id in text_cfg.full_attention_layer_ids
+        self.is_moe = _is_moe_config(config)
 
         if self.is_full_attn:
             self.self_attn = Qwen3_5Attention(config, mesh, layer_id, dtype=dtype)
         else:
             self.self_attn = Qwen3_5GatedDeltaNet(config, mesh, layer_id, dtype=dtype)
 
-        self.mlp = Qwen3_5MoeBlock(config, mesh, layer_id, dtype=dtype)
+        if self.is_moe:
+            self.mlp = Qwen3_5MoeBlock(config, mesh, layer_id, dtype=dtype)
+        else:
+            self.mlp = Qwen3MLP(
+                hidden_size=text_cfg.hidden_size,
+                intermediate_size=text_cfg.intermediate_size,
+                mesh=mesh,
+                layer_id=layer_id,
+                dtype=dtype,
+            )
         self.input_layernorm = GemmaRMSNorm(text_cfg.hidden_size, epsilon=text_cfg.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(
             text_cfg.hidden_size, epsilon=text_cfg.rms_norm_eps
@@ -464,7 +479,11 @@ class Qwen3_5DecoderLayer(nnx.Module):
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
 
-        hidden_states, topk_ids = self.mlp(hidden_states, forward_batch, dispatch_info)
+        if self.is_moe:
+            hidden_states, topk_ids = self.mlp(hidden_states, forward_batch, dispatch_info)
+        else:
+            hidden_states = self.mlp(hidden_states)
+            topk_ids = None
         return hidden_states, residual, attn_state, topk_ids
 
 
@@ -480,6 +499,7 @@ class Qwen3_5MoeModel(nnx.Module):
     ):
         text_cfg = config.text_config
         self.config = config
+        self.is_moe = _is_moe_config(config)
         self.embed_tokens = Embed(
             num_embeddings=text_cfg.vocab_size,
             features=text_cfg.hidden_size,
@@ -502,7 +522,7 @@ class Qwen3_5MoeModel(nnx.Module):
         layers_kv_fused = []
         layers_rec_buffers = []
         layers_conv_buffers = []
-        layers_topk_ids = []
+        layers_topk_ids = [] if self.is_moe else None
         for layer in self.layers:
             hidden_states, residual, attn_state, topk_ids = layer(
                 forward_batch.positions,
@@ -518,7 +538,8 @@ class Qwen3_5MoeModel(nnx.Module):
                 rec_buf, conv_buf_list = attn_state
                 layers_rec_buffers.append(rec_buf)
                 layers_conv_buffers.append(conv_buf_list)
-            layers_topk_ids.append(topk_ids)
+            if layers_topk_ids is not None:
+                layers_topk_ids.append(topk_ids)
 
         if residual is not None:
             hidden_states = hidden_states + residual
@@ -679,6 +700,7 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module):
         tc = hf_config.text_config
         num_layers = int(tc.num_hidden_layers)
         gdn_layers = list(tc.linear_layer_ids)
+        is_moe = _is_moe_config(hf_config)
 
         mappings, visual_skip, mtp_skip = _create_qwen3_5_weight_mappings(hf_config)
 
@@ -696,8 +718,9 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module):
                     f"{s}.conv1d.weight",
                 }
             )
-        for i in range(num_layers):
-            special.add(f"model.language_model.layers.{i}.mlp.experts.gate_up_proj")
+        if is_moe:
+            for i in range(num_layers):
+                special.add(f"model.language_model.layers.{i}.mlp.experts.gate_up_proj")
 
         simple = {k: v for k, v in mappings.items() if k not in special}
 
@@ -709,8 +732,9 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module):
         with SequentialSafetensorManager() as fm:
             for i in gdn_layers:
                 self._load_gdn_layer(fm, weight_info, i, tp)
-            for i in range(num_layers):
-                self._load_moe_gate_up(fm, weight_info, i)
+            if is_moe:
+                for i in range(num_layers):
+                    self._load_moe_gate_up(fm, weight_info, i)
 
         self._log_load_summary(mappings, weight_info, visual_skip, mtp_skip)
 
@@ -777,11 +801,12 @@ def _create_qwen3_5_weight_mappings(hf_config):
         sharding=(None,),
         transpose=False,
     )
-    mappings["lm_head.weight"] = WeightMapping(
-        target_path="lm_head.embedding",
-        sharding=("tensor", None),
-        transpose=False,
-    )
+    if not getattr(hf_config, "tie_word_embeddings", False):
+        mappings["lm_head.weight"] = WeightMapping(
+            target_path="lm_head.embedding",
+            sharding=("tensor", None),
+            transpose=False,
+        )
 
     for i in range(num_layers):
         is_full = i in full_attn_ids
@@ -861,44 +886,65 @@ def _create_qwen3_5_weight_mappings(hf_config):
                 transpose=True,
             )
 
-        # MoE (all 40 layers). Experts are pre-fused on disk.
-        mappings[f"{src}.mlp.gate.weight"] = WeightMapping(
-            target_path=f"{dst}.mlp.moe_gate.kernel", sharding=(None, None), transpose=True
-        )
-        mappings[f"{src}.mlp.experts.gate_up_proj"] = WeightMapping(
-            target_path=[f"{dst}.mlp.experts.w1", f"{dst}.mlp.experts.w3"],
-            sharding=(("data", "tensor"), None, None),
-            transpose=False,
-        )
-        # HF down_proj [E, hidden, inter] -> w2 [E, inter, hidden] (transpose last 2).
-        mappings[f"{src}.mlp.experts.down_proj"] = WeightMapping(
-            target_path=f"{dst}.mlp.experts.w2",
-            sharding=(("data", "tensor"), None, None),
-            transpose=False,
-            transpose_axes=(0, 2, 1),
-        )
-        mappings[f"{src}.mlp.shared_expert.gate_proj.weight"] = WeightMapping(
-            target_path=f"{dst}.mlp.shared_experts.gate_proj.weight",
-            sharding=(None, "tensor"),
-            transpose=True,
-        )
-        mappings[f"{src}.mlp.shared_expert.up_proj.weight"] = WeightMapping(
-            target_path=f"{dst}.mlp.shared_experts.up_proj.weight",
-            sharding=(None, "tensor"),
-            transpose=True,
-        )
-        mappings[f"{src}.mlp.shared_expert.down_proj.weight"] = WeightMapping(
-            target_path=f"{dst}.mlp.shared_experts.down_proj.weight",
-            sharding=("tensor", None),
-            transpose=True,
-        )
-        mappings[f"{src}.mlp.shared_expert_gate.weight"] = WeightMapping(
-            target_path=f"{dst}.mlp.shared_expert_gate.weight",
-            sharding=(None, None),
-            transpose=True,
-        )
+        if _is_moe_config(hf_config):
+            # MoE experts are pre-fused on disk.
+            mappings[f"{src}.mlp.gate.weight"] = WeightMapping(
+                target_path=f"{dst}.mlp.moe_gate.kernel", sharding=(None, None), transpose=True
+            )
+            mappings[f"{src}.mlp.experts.gate_up_proj"] = WeightMapping(
+                target_path=[f"{dst}.mlp.experts.w1", f"{dst}.mlp.experts.w3"],
+                sharding=(("data", "tensor"), None, None),
+                transpose=False,
+            )
+            # HF down_proj [E, hidden, inter] -> w2 [E, inter, hidden].
+            mappings[f"{src}.mlp.experts.down_proj"] = WeightMapping(
+                target_path=f"{dst}.mlp.experts.w2",
+                sharding=(("data", "tensor"), None, None),
+                transpose=False,
+                transpose_axes=(0, 2, 1),
+            )
+            mappings[f"{src}.mlp.shared_expert.gate_proj.weight"] = WeightMapping(
+                target_path=f"{dst}.mlp.shared_experts.gate_proj.weight",
+                sharding=(None, "tensor"),
+                transpose=True,
+            )
+            mappings[f"{src}.mlp.shared_expert.up_proj.weight"] = WeightMapping(
+                target_path=f"{dst}.mlp.shared_experts.up_proj.weight",
+                sharding=(None, "tensor"),
+                transpose=True,
+            )
+            mappings[f"{src}.mlp.shared_expert.down_proj.weight"] = WeightMapping(
+                target_path=f"{dst}.mlp.shared_experts.down_proj.weight",
+                sharding=("tensor", None),
+                transpose=True,
+            )
+            mappings[f"{src}.mlp.shared_expert_gate.weight"] = WeightMapping(
+                target_path=f"{dst}.mlp.shared_expert_gate.weight",
+                sharding=(None, None),
+                transpose=True,
+            )
+        else:
+            mappings[f"{src}.mlp.gate_proj.weight"] = WeightMapping(
+                target_path=f"{dst}.mlp.gate_proj.weight",
+                sharding=(None, "tensor"),
+                transpose=True,
+            )
+            mappings[f"{src}.mlp.up_proj.weight"] = WeightMapping(
+                target_path=f"{dst}.mlp.up_proj.weight",
+                sharding=(None, "tensor"),
+                transpose=True,
+            )
+            mappings[f"{src}.mlp.down_proj.weight"] = WeightMapping(
+                target_path=f"{dst}.mlp.down_proj.weight",
+                sharding=("tensor", None),
+                transpose=True,
+            )
 
     return mappings, _VISUAL_SKIP_PATTERNS, _MTP_SKIP_PATTERNS
 
 
-EntryClass = Qwen3_5MoeForConditionalGeneration
+class Qwen3_5ForConditionalGeneration(Qwen3_5MoeForConditionalGeneration):
+    """Dense Qwen3.5 entry point; execution is selected from the config."""
+
+
+EntryClass = [Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]
