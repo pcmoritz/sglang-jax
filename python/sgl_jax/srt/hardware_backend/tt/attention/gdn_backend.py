@@ -10,12 +10,14 @@ from sgl_jax.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
 
 
 class TTGDNAttnBackend(GDNAttnBackend):
-    # Recurrent dynamics need BF16 weights, not the full-attention BF8 default.
+    # Quantize only annotated matrix weights; recurrent arithmetic stays FP32.
     compiler_options = {
         key: value
         for key, value in TTAttention.compiler_options.items()
         if key != "experimental_weight_dtype"
     }
+    # Materialize weight transposes once instead of strided DRAM reads on decode.
+    compiler_options["experimental_enable_permute_matmul_fusion"] = "false"
 
     def __init__(self, **kwargs):
         kwargs["prefill_impl"] = "chunked_jax"
@@ -27,7 +29,7 @@ class TTGDNAttnBackend(GDNAttnBackend):
 
     def prepare_model_state(self, leaves):
         return tuple(
-            ops.annotate_weight_dtype(leaf, "bf16")
+            ops.annotate_weight_dtype(leaf, "bfp_bf8" if leaf.ndim >= 2 else "bf16")
             if getattr(leaf, "ndim", 0) > 0
             and getattr(leaf, "dtype", None) in (jnp.bfloat16, jnp.float32)
             else leaf
@@ -44,13 +46,14 @@ class TTGDNAttnBackend(GDNAttnBackend):
 
     def _qkv(self, mixed):
         count = mixed.shape[0]
-        q = mixed[:, : self.key_dim].reshape(count, self.num_k_heads, self.head_k_dim)
-        k = mixed[:, self.key_dim : 2 * self.key_dim].reshape(q.shape)
+        # Q and K use the same normalization and head expansion. Process them
+        # together to avoid launching the identical operation chain twice.
+        qk = mixed[:, : 2 * self.key_dim].reshape(count, 2 * self.num_k_heads, self.head_k_dim)
         v = mixed[:, 2 * self.key_dim :].reshape(count, self.num_v_heads, self.head_v_dim)
         repeats = self.num_v_heads // self.num_k_heads
-        sharding = jax.sharding.NamedSharding(self.mesh, jax.typeof(q).sharding.spec)
-        q = jnp.repeat(_l2norm(q.astype(jnp.float32)), repeats, axis=1, out_sharding=sharding)
-        k = jnp.repeat(_l2norm(k.astype(jnp.float32)), repeats, axis=1, out_sharding=sharding)
+        sharding = jax.sharding.NamedSharding(self.mesh, jax.typeof(qk).sharding.spec)
+        qk = jnp.repeat(_l2norm(qk.astype(jnp.float32)), repeats, axis=1, out_sharding=sharding)
+        q, k = qk[:, : self.num_v_heads], qk[:, self.num_v_heads :]
         return q * self.head_k_dim**-0.5, k, v.astype(jnp.float32)
 
     def forward_decode(

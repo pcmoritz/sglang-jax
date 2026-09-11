@@ -27,6 +27,28 @@ def isolated_mesh():
         yield
 
 
+def test_weight_precision_policy(monkeypatch):
+    annotations = []
+
+    def annotate(value, dtype):
+        annotations.append((value.shape, dtype))
+        return value
+
+    monkeypatch.setattr(ops, "annotate_weight_dtype", annotate)
+    leaves = (
+        jnp.ones((128, 64), jnp.bfloat16),  # Projection weights.
+        jnp.ones((128,), jnp.float32),  # Decay, bias, and normalization parameters.
+        jnp.ones((), jnp.float32),
+        jnp.ones((32,), jnp.int32),
+    )
+    backend = TTGDNAttnBackend.__new__(TTGDNAttnBackend)
+    prepared = backend.prepare_model_state(leaves)
+    assert all(a is b for a, b in zip(prepared, leaves))
+    assert annotations == [((128, 64), "bfp_bf8"), ((128,), "bf16")]
+    # A global weight override could also affect unannotated recurrent matmuls.
+    assert "experimental_weight_dtype" not in backend.compiler_options
+
+
 def reference_chunk(q, k, v, gate, beta, state):
     def step(state, inputs):
         return _gated_delta_step(state, *inputs)
@@ -239,10 +261,10 @@ def test_explicit_serving_mesh(decode):
     reason="requires JAX_PLATFORMS=tt,cpu and a Tenstorrent device",
 )
 @pytest.mark.parametrize("trace", [False, True])
-def test_device_state_handoff(trace):
+@pytest.mark.parametrize("heads", [(2, 4), (16, 32), (20, 40)])
+def test_device_state_handoff(trace, heads):
     """Real kernels: warmup, replay, chunk continuation, slot reuse and padding."""
     cpu, tt = jax.devices("cpu")[0], jax.devices("tt")[0]
-    heads = (16, 32)  # Qwen3.5-9B
 
     def compile_forward(decode):
         def forward(indices, initial, lengths, *args):
