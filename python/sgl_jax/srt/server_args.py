@@ -2098,6 +2098,11 @@ class ServerArgs:
 
         # DFLASH: non-causal one-shot diffusion draft + linear-chain greedy verify.
         if self.speculative_algorithm in ("DFLASH", "DSPARK"):
+            if self.device == "tt":
+                if not self.disable_overlap_schedule:
+                    raise ValueError("TT DFLASH requires --disable-overlap-schedule.")
+                if self.speculative_sample_from_anchor:
+                    raise ValueError("TT DFLASH does not support --speculative-sample-from-anchor.")
             if self.tp_size < 1:
                 raise ValueError("DFLASH requires --tp-size>=1.")
             if self.speculative_eagle_topk != 1:

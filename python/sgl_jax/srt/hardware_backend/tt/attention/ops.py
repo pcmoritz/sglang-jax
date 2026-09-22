@@ -47,7 +47,7 @@ def paged_scaled_dot_product_attention_decode(query, key_cache, value_cache, pag
     )
 
 
-def paged_update_cache(cache, value, positions, page_table):
+def paged_update_cache(cache, value, positions, page_table, *, share_cache=False):
     return _call(
         "tt.paged_update_cache",
         cache,
@@ -55,6 +55,7 @@ def paged_update_cache(cache, value, positions, page_table):
         positions,
         page_table,
         input_output_aliases={0: 0},
+        **({"share_cache": True} if share_cache else {}),
     )
 
 
