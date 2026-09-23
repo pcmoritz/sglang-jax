@@ -26,9 +26,12 @@ class Sampler(nnx.Module):
     def _greedy_sampling(self, operands):
         """Greedy sampling branch"""
         logits, _, _ = operands
+        logits = jax.sharding.reshard(logits, NamedSharding(self.mesh, P("data", None)))
         batch_next_token_ids = jnp.argmax(logits, -1).flatten()
         logprobs = jax.nn.log_softmax(logits, axis=-1)
-        return batch_next_token_ids, logprobs
+        return batch_next_token_ids, jax.sharding.reshard(
+            logprobs, NamedSharding(self.mesh, P("data", "tensor"))
+        )
 
     def _regular_sampling(self, operands):
         """Regular sampling branch"""

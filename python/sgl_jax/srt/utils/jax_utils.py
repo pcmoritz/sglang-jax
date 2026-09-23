@@ -198,7 +198,12 @@ def get_available_device_memory(
     else:
         raise ValueError(f"Invalid device: {device}")
 
-    if distributed:
+    if distributed and device == "tt":
+        # TT supports all-gather but not an all-reduce minimum.
+        from jax.experimental import multihost_utils
+
+        free_gpu_memory = multihost_utils.process_allgather(np.asarray(avail_mem)).min().item()
+    elif distributed:
         # Use pmap to find the minimum available memory across all devices.
         mesh = jax.make_mesh((jax.device_count(),), ("device"))
 

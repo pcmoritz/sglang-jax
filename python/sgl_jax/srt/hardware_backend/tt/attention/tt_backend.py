@@ -114,12 +114,13 @@ class TTAttention(AttentionBackend):
 
     token_to_kv_pool_class = TTTokenToKVPool
     compiler_options = {
+        "export_path": "/tmp/qwen-full-ir",
         "experimental_enable_permute_matmul_fusion": "true",
-        "optimization_level": "1",
+        "optimization_level": "O1",
         "experimental_weight_dtype": "bfp_bf8",
         "enable_trace": "true",
     }
-    sampler_compiler_options = {"enable_trace": "true"}
+    sampler_compiler_options = {"enable_trace": "true", "export_path": "/tmp/qwen-sampler-ir"}
 
     def __init__(self, page_size: int, mesh: jax.sharding.Mesh):
         if page_size < 32 or page_size % 32:

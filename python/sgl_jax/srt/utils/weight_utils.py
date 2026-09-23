@@ -1098,21 +1098,17 @@ class WeightLoader:
             data_np = None
 
         # 2. Broadcast the length of the data first
-        data_len = multihost_utils.broadcast_one_to_all(
-            data_len, is_source=(jax.process_index() == 0)
-        )
+        data_len = multihost_utils.process_allgather(data_len)[0]
 
         # 3. Prepare buffer on receivers
         if jax.process_index() != 0:
             data_np = np.empty(data_len.item(), dtype=np.uint8)
 
         # 4. Broadcast the actual serialized data
-        synced_data = multihost_utils.broadcast_one_to_all(
-            data_np, is_source=(jax.process_index() == 0)
-        )
+        synced_data = multihost_utils.process_allgather(data_np.astype(np.int32))[0]
 
         # 5. Deserialize
-        synced_bytes = np.array(synced_data).tobytes()
+        synced_bytes = np.asarray(synced_data, dtype=np.uint8).tobytes()
         weight_info = pickle.loads(synced_bytes)
 
         if jax.process_index() != 0:

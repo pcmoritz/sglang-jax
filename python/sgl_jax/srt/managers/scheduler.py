@@ -2938,6 +2938,9 @@ def run_scheduler_process(
     except Exception:
         traceback = get_exception_traceback()
         logger.error("Scheduler hit an exception: %s", traceback)
+        if server_args.device == "tt":
+            # Run plugin exit handlers before destroying the JAX coordinator.
+            raise
         parent_process.send_signal(signal.SIGQUIT)
 
 

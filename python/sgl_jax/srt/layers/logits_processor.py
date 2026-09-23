@@ -262,6 +262,11 @@ class LogitsProcessor(nnx.Module):
             hidden_states, NamedSharding(self.mesh, P("data", None))
         )
 
+        if self.mesh.shape["data"] == 1:
+            return hidden_states.at[indices].get(
+                out_sharding=NamedSharding(self.mesh, P("data", None))
+            )
+
         def select_local_fn(local_states, local_indices):
             return local_states[local_indices]
 
