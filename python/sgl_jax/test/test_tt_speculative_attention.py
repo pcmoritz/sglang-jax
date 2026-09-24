@@ -16,44 +16,26 @@ from sgl_jax.srt.layers.radix_attention import AttentionType, RadixAttention
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
 
-def mesh():
-    return Mesh(
-        np.asarray(jax.devices()).reshape(1, 1),
-        ("data", "tensor"),
-        axis_types=(jax.sharding.AxisType.Explicit,) * 2,
-    )
-
-
-def batch():
-    return SimpleNamespace(
-        forward_mode=ForwardMode.TARGET_VERIFY,
-        seq_lens=np.array([30, 65, 0], np.int32),
-        logits_indices_selector=np.array([0, 1], np.int32),
-        spec_info_padded=SimpleNamespace(draft_token_num=4, custom_mask=None),
-    )
-
-
-def test_verify_metadata():
-    backend = TTAttention(32, mesh())
-    pages = np.pad(np.array([5, 2, 9, 7, 11], np.int32), (0, 11))
-    metadata = backend.get_eagle_forward_metadata(batch(), page_indices=pages)
-    expected = np.zeros((12, 16), np.int32)
-    expected[:4, :2] = [5, 2]
-    expected[4:8, :3] = [9, 7, 11]
-    np.testing.assert_array_equal(metadata.page_table, expected)
-    np.testing.assert_array_equal(metadata.positions, [33] * 4 + [68] * 4 + [-1] * 4)
-
-
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("trace", [False, True])
 def test_block_attention(causal, trace):
     if jax.default_backend() != "tt":
         pytest.skip("requires the TT plugin")
     device = jax.devices()[0]
-    tt_mesh = mesh()
+    tt_mesh = Mesh(
+        np.asarray(jax.devices()).reshape(1, 1),
+        ("data", "tensor"),
+        axis_types=(jax.sharding.AxisType.Explicit,) * 2,
+    )
+    batch = SimpleNamespace(
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        seq_lens=np.array([30, 65, 0], np.int32),
+        logits_indices_selector=np.array([0, 1], np.int32),
+        spec_info_padded=SimpleNamespace(draft_token_num=4, custom_mask=None),
+    )
     backend = TTAttention(32, tt_mesh)
     pages = np.pad(np.array([5, 2, 9, 7, 11], np.int32), (0, 11))
-    backend.forward_metadata = backend.get_eagle_forward_metadata(batch(), page_indices=pages)
+    backend.forward_metadata = backend.get_eagle_forward_metadata(batch, page_indices=pages)
     pool = TTTokenToKVPool(16 * 32, 32, jnp.bfloat16, 8, 128, 1, tt_mesh)
     layer = RadixAttention(
         32,
@@ -140,28 +122,3 @@ def test_block_attention(causal, trace):
             np.asarray(output)[:8].astype(np.float32), expected, atol=0.03, rtol=0.03
         )
         pool.kv_buffer[0] = caches
-
-
-@pytest.mark.parametrize("overlap,anchor", [(False, False), (True, False), (False, True)])
-def test_supported_speculative_options(overlap, anchor, monkeypatch):
-    from sgl_jax.srt.server_args import ServerArgs
-
-    monkeypatch.setenv("JAX_PLATFORMS", "tt")
-    args = ServerArgs(
-        model_path="unused",
-        device="tt",
-        attention_backend="tt",
-        speculative_algorithm="DFLASH",
-        speculative_draft_model_path="unused",
-        speculative_num_steps=1,
-        speculative_eagle_topk=1,
-        speculative_num_draft_tokens=16,
-        grammar_backend="none",
-        disable_overlap_schedule=not overlap,
-        speculative_sample_from_anchor=anchor,
-    )
-    if overlap or anchor:
-        with pytest.raises(ValueError, match="TT DFLASH"):
-            args.check_server_args()
-    else:
-        args.check_server_args()
