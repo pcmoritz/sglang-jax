@@ -1182,10 +1182,20 @@ class WeightLoader:
                 # Fallback: Load full tensor on every host (Replicated)
                 sharding = jax.sharding.NamedSharding(self.mesh, P())
 
-            def _make_load_slice(fname=filename, fm=file_manager, target_dtype=target_dtype):
+            def _make_load_slice(
+                fname=filename, fm=file_manager, target_dtype=target_dtype, tensor_shape=shape
+            ):
                 def _load_slice(index):
                     f = fm.get_handle(fname)
-                    data = f.get_slice(hf_key)[index]
+                    # Avoid the slicing copy path when this shard needs the whole tensor.
+                    is_full_tensor = len(index) == len(tensor_shape) and all(
+                        isinstance(s, slice)
+                        and s.start in (None, 0)
+                        and s.stop in (None, size)
+                        and s.step in (None, 1)
+                        for s, size in zip(index, tensor_shape)
+                    )
+                    data = f.get_tensor(hf_key) if is_full_tensor else f.get_slice(hf_key)[index]
                     return _reinterpret_dtype_if_needed(data, target_dtype)
 
                 return _load_slice
