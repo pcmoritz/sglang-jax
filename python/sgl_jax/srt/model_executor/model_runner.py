@@ -1035,9 +1035,14 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         multimodal_batch: MultimodalBatch | None = None,
     ) -> None:
         """Prepare encoder embeddings before ordinary or fused model calls."""
-        if isinstance(self.model, InModelMultimodalContract) and forward_batch.forward_mode in (
-            ForwardMode.EXTEND,
-            ForwardMode.MIXED,
+        if (
+            isinstance(self.model, InModelMultimodalContract)
+            and forward_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+            # A text-only batch needs no merged embeddings: the model embeds its
+            # input ids itself, inside the compiled program, so the embedding
+            # table stays a parameter of every program (no eager lookup that
+            # wants the table in another layout than the decode program).
+            and (multimodal_batch is not None or self.model.deepstack_visual_layers)
         ):
             input_embedding, deepstack, apply_for_deepstack = embed_multimodal_inputs(
                 multimodal_batch=multimodal_batch,
