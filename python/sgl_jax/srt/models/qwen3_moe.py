@@ -75,6 +75,7 @@ class QWen3MoeAttention(nnx.Module):
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
             mesh=mesh,
+            scope_name="q_proj",
         )
         self.k_proj = LinearBase(
             input_size=hidden_size,
@@ -83,6 +84,7 @@ class QWen3MoeAttention(nnx.Module):
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
             mesh=mesh,
+            scope_name="k_proj",
         )
         self.v_proj = LinearBase(
             input_size=hidden_size,
@@ -91,6 +93,7 @@ class QWen3MoeAttention(nnx.Module):
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
             mesh=mesh,
+            scope_name="v_proj",
         )
         self.c_proj = LinearBase(
             input_size=num_heads * self.head_dim,
@@ -99,6 +102,7 @@ class QWen3MoeAttention(nnx.Module):
             kernel_axes=("tensor", None),
             params_dtype=dtype,
             mesh=mesh,
+            scope_name="o_proj",
         )
         self.rotary_emb = get_rope(
             head_size=self.head_dim,

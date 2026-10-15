@@ -483,6 +483,10 @@ class FusedEPMoE(nnx.Module):
     ) -> jax.Array:
         """Forward pass through the fused MoE layer."""
         assert hidden_states.ndim == 2
+        if self.mesh.devices.flat[0].platform == "tt":
+            from sgl_jax.srt.hardware_backend.tt.fused_moe import fused_ep_moe as tt_fused_ep_moe
+
+            return tt_fused_ep_moe(self, hidden_states, topk_weights, topk_ids, out_sharding)
 
         w1_shared_val = self.w1_shared.value if self.w1_shared is not None else None
         w3_shared_val = self.w3_shared.value if self.w3_shared is not None else None

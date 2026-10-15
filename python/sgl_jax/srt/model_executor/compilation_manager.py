@@ -10,6 +10,7 @@ from contextlib import nullcontext
 from contextvars import copy_context
 from typing import TYPE_CHECKING
 
+import jax
 import numpy as np
 from tqdm import tqdm
 
@@ -198,7 +199,11 @@ class CompilationManager:
 
     def _compute_bs_buckets(self, user_paddings: list[int] | None) -> list[int]:
         bs_list = user_paddings if user_paddings is not None else PRECOMPILE_DEFAULT_BS_PADDINGS
-        is_fused_moe = self.moe_backend in ("fused", "fused_v2")
+        # The TPU fused-MoE kernel needs at least 2 tokens per EP rank; TT runs
+        # FusedEPMoE through its own kernel, which doesn't.
+        is_fused_moe = (
+            self.moe_backend in ("fused", "fused_v2") and jax.devices()[0].platform != "tt"
+        )
         min_fused_bs = self.tp_size * 2
         if is_fused_moe and self.max_padded_batch_size < min_fused_bs:
             raise ValueError(
@@ -315,7 +320,9 @@ class CompilationManager:
         # architectures that hard-code FusedEPMoE (e.g. Qwen3.5 MoE) are
         # covered even when the raw server_args string stays at "epmoe".
         mesh_ep_size = server_args.tp_size
-        if moe_backend in ("fused", "fused_v2") and mesh_ep_size > 1:
+        # TT runs FusedEPMoE through its own kernel, which has no batch constraints.
+        uses_tpu_kernel = moe_backend in ("fused", "fused_v2") and jax.devices()[0].platform != "tt"
+        if uses_tpu_kernel and mesh_ep_size > 1:
             from sgl_jax.srt.utils.common_utils import align_bs_for_fused_ep
 
             assert mesh_ep_size % dp_size == 0, (
