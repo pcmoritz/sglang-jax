@@ -102,6 +102,8 @@ class TTAttentionMetadata:
     prefill_chunk_start: jax.Array | None = None
     prefill_input_indices: jax.Array | None = None
     prefill_output_indices: jax.Array | None = None
+    # Cache slots for each verify token's K and V, when not out_cache_loc.
+    cache_loc: jax.Array | None = None
 
 
 def _pad_page_table(table: np.ndarray, users: int) -> np.ndarray:
@@ -196,36 +198,97 @@ class TTAttention(AttentionBackend):
             return self._decode_metadata(batch)
         raise ValueError(f"TT attention does not support {batch.forward_mode}")
 
-    def get_eagle_forward_metadata(self, batch: ModelWorkerBatch, *, page_indices, **_):
-        """Metadata for linear-chain verification and DFlash draft blocks.
+    def get_eagle_forward_metadata(self, batch: ModelWorkerBatch, *, page_indices=None, **_):
+        """Metadata for linear-chain verification, EAGLE draft extends and
+        DFlash draft blocks.
 
         Every query token is a decode user holding its request's page table.
         The positions attend over the whole block; causal layers narrow them
-        to each token's own position in `_verify`.
+        to each token's own position in `_verify`. An EAGLE draft prefill is
+        an ordinary prefill.
         """
-        if batch.forward_mode != ForwardMode.TARGET_VERIFY:
+        if batch.forward_mode == ForwardMode.EXTEND:
+            return self._prefill_metadata(batch)
+        if batch.forward_mode not in (ForwardMode.TARGET_VERIFY, ForwardMode.DRAFT_EXTEND):
             raise ValueError(f"TT speculative attention does not support {batch.forward_mode}")
-        if batch.spec_info_padded.custom_mask is not None:
+        if getattr(batch.spec_info_padded, "custom_mask", None) is not None:
             raise ValueError("TT speculative attention requires a linear draft chain")
-        tokens = batch.spec_info_padded.draft_token_num
         active = np.zeros(len(batch.seq_lens), dtype=bool)
         active[batch.logits_indices_selector] = True
-        lengths = np.where(active, np.asarray(batch.seq_lens, dtype=np.int32) + tokens, 0)
+        if batch.forward_mode == ForwardMode.TARGET_VERIFY:
+            tokens = batch.spec_info_padded.draft_token_num
+        else:
+            tokens = int(np.max(batch.extend_seq_lens))
 
-        # page_indices packs the pages of the active requests in batch order.
-        page_counts = cdiv(lengths, self.page_size)
-        page_ends = np.cumsum(page_counts)
-        page_table = np.zeros((len(lengths), max(16, len(page_indices))), dtype=np.int32)
-        for row, (count, end) in enumerate(zip(page_counts, page_ends)):
-            page_table[row, :count] = page_indices[end - count : end]
+        cache_loc = None
+        if page_indices is None:
+            page_table = self._eagle_page_table(batch)
+            # EAGLE's out_cache_loc holds the round's new allocation, so write
+            # each token at its position: a verify's tokens follow the
+            # verified ones, and a draft extend writes the same positions.
+            first = np.asarray(batch.seq_lens, dtype=np.int32)
+            if batch.forward_mode == ForwardMode.DRAFT_EXTEND:
+                first = first - (tokens - 1)
+            written = first[:, None] + np.arange(tokens, dtype=np.int32)
+            pages = np.take_along_axis(page_table, written // self.page_size, axis=1)
+            cache_loc = np.where(
+                active[:, None], pages * self.page_size + written % self.page_size, -1
+            ).astype(np.int32)
+            lengths = np.where(active, written[:, -1] + 1, 0)
+        else:
+            lengths = np.where(active, np.asarray(batch.seq_lens, dtype=np.int32) + tokens, 0)
+            # page_indices packs the pages of the active requests in batch order.
+            page_counts = cdiv(lengths, self.page_size)
+            page_ends = np.cumsum(page_counts)
+            page_table = np.zeros((len(lengths), max(16, len(page_indices))), dtype=np.int32)
+            for row, (count, end) in enumerate(zip(page_counts, page_ends)):
+                page_table[row, :count] = page_indices[end - count : end]
         positions = np.where(active, lengths - 1, -1).astype(np.int32)
 
         metadata = TTAttentionMetadata()
+        sharding = NamedSharding(self.mesh, P("data"))
         metadata.page_table, metadata.positions = device_array(
             (np.repeat(page_table, tokens, axis=0), np.repeat(positions, tokens)),
-            sharding=NamedSharding(self.mesh, P("data")),
+            sharding=sharding,
         )
+        if cache_loc is not None:
+            metadata.cache_loc = device_array(cache_loc.reshape(-1), sharding=sharding)
         return metadata
+
+    def get_eagle_multi_step_metadata(self, batch: ModelWorkerBatch):
+        """Metadata for each of an EAGLE draft's decode steps.
+
+        Step i writes and attends up to position seq_len - 1 + i, the next
+        position after the request's verified tokens.
+        """
+        page_table = self._eagle_page_table(batch)
+        lengths = np.asarray(batch.seq_lens, dtype=np.int32)
+        sharding = NamedSharding(self.mesh, P("data"))
+        steps = []
+        for step in range(batch.speculative_num_steps):
+            metadata = TTAttentionMetadata()
+            positions = np.where(lengths > 0, lengths - 1 + step, -1).astype(np.int32)
+            metadata.page_table, metadata.positions = device_array(
+                (page_table, positions), sharding=sharding
+            )
+            steps.append(metadata)
+        return steps
+
+    def _eagle_page_table(self, batch: ModelWorkerBatch) -> np.ndarray:
+        """Page tables from an EAGLE batch's cache_loc, which holds each live
+        request's pages in batch order, the request's allocation each."""
+        lengths = np.asarray(batch.seq_lens)
+        allocated = np.asarray(batch.spec_info_padded.allocate_lens)
+        live = np.flatnonzero(lengths > 0)
+        if len(allocated) != len(live):
+            allocated = allocated[live]
+        pages = np.asarray(batch.cache_loc, dtype=np.int32)[:: self.page_size] // self.page_size
+        counts = cdiv(allocated, self.page_size)
+        starts = np.cumsum(counts) - counts
+        table = np.zeros((len(lengths), max(16, len(pages))), dtype=np.int32)
+        for row, start, count in zip(live, starts, counts):
+            table[row, :count] = pages[start : start + count]
+        return table
 
     def _decode_metadata(self, batch: ModelWorkerBatch) -> TTAttentionMetadata:
         sequence_lengths = np.asarray(batch.seq_lens, dtype=np.int32)[: batch.real_bs]
@@ -344,7 +407,7 @@ class TTAttention(AttentionBackend):
             return self._prefill(q, k, v, layer, token_to_kv_pool)
         if forward_batch.forward_mode == ForwardMode.DECODE:
             return self._decode(q, k, v, layer, token_to_kv_pool)
-        if forward_batch.forward_mode == ForwardMode.TARGET_VERIFY:
+        if forward_batch.forward_mode in (ForwardMode.TARGET_VERIFY, ForwardMode.DRAFT_EXTEND):
             return self._verify(q, k, v, layer, forward_batch, token_to_kv_pool)
         raise ValueError(f"TT attention does not support {forward_batch.forward_mode}")
 
@@ -422,7 +485,10 @@ class TTAttention(AttentionBackend):
 
     def _verify(self, q, k, v, layer, forward_batch, token_to_kv_pool):
         metadata = self.forward_metadata
-        token_to_kv_pool.set_kv_buffer(layer.layer_id, forward_batch.out_cache_loc, k, v)
+        cache_loc = metadata.cache_loc
+        if cache_loc is None:
+            cache_loc = forward_batch.out_cache_loc
+        token_to_kv_pool.set_kv_buffer(layer.layer_id, cache_loc, k, v)
         k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
         positions = metadata.positions
         if layer.attn_type == AttentionType.DECODER:

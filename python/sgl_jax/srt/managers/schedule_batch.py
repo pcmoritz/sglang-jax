@@ -2722,6 +2722,16 @@ class ScheduleBatch:
             if target_per_rank_ocl > 0
             else np.empty(0, dtype=np.int32)
         )
+        # The recurrent state slots, for a verify of a hybrid recurrent model.
+        recurrent_indices = None
+        if self.is_hybrid_recurrent:
+            recurrent_indices = np.zeros(total_bs, dtype=np.int32)
+            for dp_rank, info in enumerate(self.reqs_info):
+                if info.reqs:
+                    start = dp_rank * per_dp_bs
+                    recurrent_indices[start : start + len(info.reqs)] = (
+                        self.req_to_token_pool.get_linear_recurrent_indices(info.req_pool_indices)
+                    )
         model_worker_batch = ModelWorkerBatch(
             bid=acc_global_bid(),
             forward_mode=self.forward_mode,
@@ -2754,6 +2764,8 @@ class ScheduleBatch:
             spec_algorithm=self.spec_algorithm,
             tree_cache=self.tree_cache,
             mrope_positions=None,
+            recurrent_indices=recurrent_indices,
+            has_initial_state=np.ones(total_bs, dtype=np.bool_),
         )
         return model_worker_batch
 

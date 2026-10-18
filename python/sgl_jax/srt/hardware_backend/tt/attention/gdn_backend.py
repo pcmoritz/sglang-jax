@@ -5,30 +5,40 @@ from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.hardware_backend.tt.attention import ops
-from sgl_jax.srt.hardware_backend.tt.attention.tt_backend import TTAttention
+from sgl_jax.srt.hardware_backend.tt.attention.tt_backend import (
+    MAX_DECODE_USERS,
+    TTAttention,
+)
 from sgl_jax.srt.kernels.gdn.gated_delta import _l2norm
 from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
     LinearRecurrentAttnBackendMetadata,
 )
 from sgl_jax.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+from sgl_jax.srt.mem_cache.recurrent_state_pool import accepted_state_slots
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+from sgl_jax.srt.utils.jax_utils import device_array
 
 
 @jax.tree_util.register_pytree_node_class
 @dataclass
 class TTGDNMetadata(LinearRecurrentAttnBackendMetadata):
     max_prefill_len: int = 0
+    # Speculative verify: draft tokens per request, 0 otherwise.
+    verify_tokens: int = 0
 
     def tree_flatten(self):
         children, _ = super().tree_flatten()
-        return children, self.max_prefill_len
+        return children, (self.max_prefill_len, self.verify_tokens)
 
     @classmethod
-    def tree_unflatten(cls, max_prefill_len, children):
+    def tree_unflatten(cls, aux, children):
         meta = super().tree_unflatten({}, children)
-        meta.max_prefill_len = max_prefill_len
+        meta.max_prefill_len, meta.verify_tokens = aux
         return meta
 
 
@@ -62,6 +72,39 @@ def _per_device(forward):
     return run
 
 
+@functools.cache
+def _keep_states(mesh):
+    """A traced program copying source slots to target slots, in place, in
+    every layer's recurrent and convolution pools."""
+
+    def copy(pool, source, target):
+        for start in range(0, source.shape[0], MAX_DECODE_USERS):
+            rows = slice(start, start + MAX_DECODE_USERS)
+            pool = ops.state_pool_copy(pool, source[rows], target[rows])
+        return pool
+
+    def keep(recurrent, conv, source, target):
+        rows = P("data")
+        copy_states = jax.shard_map(
+            copy,
+            mesh=mesh,
+            in_specs=(P("data", "tensor", None, None), rows, rows),
+            out_specs=P("data", "tensor", None, None),
+        )
+        copy_windows = jax.shard_map(
+            copy,
+            mesh=mesh,
+            in_specs=(P("data", "tensor", None), rows, rows),
+            out_specs=P("data", "tensor", None),
+        )
+        return (
+            [copy_states(pool, source, target) for pool in recurrent],
+            [[copy_windows(pool, source, target) for pool in pools] for pools in conv],
+        )
+
+    return jax.jit(keep, donate_argnums=(0, 1), compiler_options=TTGDNAttnBackend.compiler_options)
+
+
 class TTGDNAttnBackend(GDNAttnBackend):
     # Quantize only annotated matrix weights; recurrent arithmetic stays FP32.
     compiler_options = {
@@ -81,6 +124,8 @@ class TTGDNAttnBackend(GDNAttnBackend):
             raise NotImplementedError("TT GDN requires 128-wide heads and a four-tap convolution")
 
     def get_forward_metadata(self, batch):
+        if batch.forward_mode == ForwardMode.TARGET_VERIFY:
+            return self._verify_metadata(batch)
         meta = super().get_forward_metadata(batch)
         if batch.forward_mode.is_extend():
             # Prefill packs each live sequence; exclude the scheduler's dummy rows.
@@ -94,6 +139,35 @@ class TTGDNAttnBackend(GDNAttnBackend):
             meta = TTGDNMetadata(
                 **vars(meta), max_prefill_len=1 << (max(length, 32) - 1).bit_length()
             )
+        return meta
+
+    def keep_accepted(self, pool, slots, accepted, tokens: int) -> None:
+        """Copy each request's state after its accepted draft tokens from its
+        verify slot to its own slot. The copy is in place: the next forward's
+        trace was captured with the pool's current buffers."""
+        source = accepted_state_slots(slots, accepted, tokens, pool.slots_per_rank)
+        if not source.any():
+            return
+        target = np.where(source > 0, slots, 0).astype(np.int32)
+        source, target = device_array(
+            (source, target), sharding=NamedSharding(self.mesh, P("data"))
+        )
+        pool.replace_buffer(
+            _keep_states(self.mesh)(pool.recurrent_buffers, pool.conv_buffers, source, target)
+        )
+
+    def _verify_metadata(self, batch):
+        """Each request verifies a linear chain of draft tokens."""
+        size = len(batch.seq_lens)
+        slots, initial = (
+            np.pad(np.asarray(value)[:size], (0, max(0, size - len(value))))
+            for value in (batch.recurrent_indices, batch.has_initial_state)
+        )
+        meta = TTGDNMetadata(verify_tokens=batch.spec_info_padded.draft_token_num)
+        meta.recurrent_indices, meta.has_initial_state = device_array(
+            (slots.astype(np.int32), initial.astype(bool)),
+            sharding=NamedSharding(self.mesh, P("data")),
+        )
         return meta
 
     def _metadata(self, meta):
@@ -142,8 +216,74 @@ class TTGDNAttnBackend(GDNAttnBackend):
         )
         return out.astype(mixed_qkv.dtype), new_conv, new_rec
 
+    def forward_extend(self, *args, seq_lens):
+        if self.forward_metadata.verify_tokens:
+            return self._forward_verify(*args)
+        return self._forward_prefill(*args, seq_lens=seq_lens)
+
     @_per_device
-    def forward_extend(
+    def _forward_verify(
+        self,
+        meta,
+        mixed_qkv,
+        conv_state_in,
+        recurrent_state_in,
+        b,
+        a,
+        conv1d_weight,
+        A_log,
+        dt_bias,
+    ):
+        """Run each request's draft tokens and keep the state after each one.
+
+        The state after token t goes to slot ``states[:, t]``: the request's
+        own slot for the last token, its verify slots (RecurrentStatePool's
+        ``verify_state_slots``) for the others. Once the accepted count is
+        known, the speculative worker copies its state to the request's slot.
+        """
+        tokens = meta.verify_tokens
+        indices, initial = meta.recurrent_indices, meta.has_initial_state
+        batch = indices.shape[0]
+        rows = recurrent_state_in.shape[0]
+        if (rows - 1) % tokens:
+            raise ValueError("The recurrent state pool has no verify slots for this draft length")
+        first = (rows - 1) // tokens + 1 + (indices - 1) * (tokens - 1)
+        states = first[:, None] + jnp.arange(tokens, dtype=indices.dtype)
+        states = jnp.where(jnp.arange(tokens) == tokens - 1, indices[:, None], states)
+        states = jnp.where(indices[:, None] > 0, states, 0)
+
+        # The kernels carry each state through its tokens and write the state
+        # after each one to its slot, a tile row of tokens per call.
+        conv, state, outputs = conv_state_in, recurrent_state_in, []
+        group = max(1, MAX_DECODE_USERS // tokens)
+        for start in range(0, batch, group):
+            requests = slice(start, start + group)
+            steps = slice(start * tokens, (start + group) * tokens)
+            conv, convolved = ops.causal_conv1d_update(
+                conv,
+                mixed_qkv[steps],
+                conv1d_weight,
+                indices[requests],
+                initial[requests],
+                state_slots=states[requests],
+            )
+            state, out = ops.gated_delta_decode(
+                state,
+                convolved,
+                b[steps],
+                a[steps],
+                A_log,
+                dt_bias,
+                indices[requests],
+                initial[requests],
+                state_slots=states[requests],
+            )
+            outputs.append(out)
+        out = jnp.concatenate(outputs) if len(outputs) > 1 else outputs[0]
+        return out.astype(mixed_qkv.dtype), conv, state
+
+    @_per_device
+    def _forward_prefill(
         self,
         meta,
         mixed_qkv,

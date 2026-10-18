@@ -259,5 +259,8 @@ def get_qwen3_5_hybrid_config(hf_config: Any) -> Qwen3_5HybridConfig | None:
     (``qwen3_5_moe``) and dense (``qwen3_5``) root model types.
     """
     if getattr(hf_config, "model_type", None) in {"qwen3_5_moe", "qwen3_5"}:
+        # An MTP draft keeps the config but has only full-attention layers.
+        if not hf_config.text_config.linear_layer_ids:
+            return None
         return hf_config
     return None

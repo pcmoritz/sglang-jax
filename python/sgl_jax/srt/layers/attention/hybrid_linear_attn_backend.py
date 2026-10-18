@@ -196,6 +196,22 @@ class HybridLinearAttnBackend(AttentionBackend):
             linear_attn_metadata=self.linear_attn_backend.get_forward_metadata(batch),
         )
 
+    def get_eagle_forward_metadata(self, batch, **kwargs):
+        return HybridLinearAttnBackendMetadata(
+            full_attn_metadata=self.full_attn_backend.get_eagle_forward_metadata(batch, **kwargs),
+            linear_attn_metadata=self.linear_attn_backend.get_forward_metadata(batch),
+        )
+
+    def keep_accepted(self, memory_pools, slots, accepted, tokens: int) -> None:
+        """After a speculative verify of `tokens` draft tokens per request,
+        keep each request's recurrent state after its `accepted` tokens."""
+        keep = getattr(self.linear_attn_backend, "keep_accepted", None)
+        if keep is None:
+            raise NotImplementedError(
+                f"{type(self.linear_attn_backend).__name__} does not support speculative verify"
+            )
+        keep(memory_pools.recurrent_state_pool, slots, accepted, tokens)
+
     @property
     def token_to_kv_pool_class(self):
         from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool

@@ -14,6 +14,29 @@ from sgl_jax.srt.kernels.speculative.build_eagle_tree_structure_kernel import (
 )
 
 
+@functools.partial(jax.jit, static_argnames=["num_draft_tokens"])
+def verify_chain_greedy(
+    draft_tokens: jax.Array, next_token_logits: jax.Array, num_draft_tokens: int
+):
+    """verify_tree_greedy for a linear draft chain (topk=1), in plain JAX.
+
+    Returns accept_index [bs, num_draft_tokens] (-1 past the accepted
+    tokens), the accepted draft count [bs] and predict [bs * num_draft_tokens],
+    the target's token after each accepted one and 0 elsewhere.
+    """
+    target = jnp.argmax(next_token_logits, axis=-1).astype(jnp.int32)
+    target = target.reshape(-1, num_draft_tokens)
+    draft = draft_tokens.reshape(-1, num_draft_tokens)
+    matches = (draft[:, 1:] == target[:, :-1]).astype(jnp.int32)
+    count = jnp.cumprod(matches, axis=1).sum(axis=1)
+    steps = jnp.arange(num_draft_tokens, dtype=jnp.int32)[None, :]
+    accepted = steps <= count[:, None]
+    rows = jnp.arange(draft.shape[0], dtype=jnp.int32)[:, None] * num_draft_tokens
+    accept_index = jnp.where(accepted, rows + steps, -1)
+    predict = jnp.where(accepted, target, 0).reshape(-1)
+    return accept_index, count, predict
+
+
 @functools.partial(
     jax.jit, static_argnames=["num_verify_tokens", "batch_size", "speculative_num_steps"]
 )

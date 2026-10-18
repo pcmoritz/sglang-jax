@@ -115,6 +115,10 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         self.draft_query_tokens = self.block_size - int(self.sample_from_anchor)
         self._target_impl = getattr(target_worker, "worker", target_worker)
         self._target_compilation_manager = self._target_impl.compilation_manager
+        if self._target_impl.model_runner.linear_recurrent_config is not None:
+            # Its verify does not keep the recurrent state after the accepted
+            # tokens (keep_accepted, as BaseSpecWorker.verify does).
+            raise NotImplementedError("DFLASH does not support hybrid recurrent targets")
 
         draft_server_args = copy.deepcopy(server_args)
         draft_server_args.skip_tokenizer_init = True

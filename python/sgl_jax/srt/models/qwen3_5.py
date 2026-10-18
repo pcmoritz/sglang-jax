@@ -601,6 +601,11 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module, InModelMultimodalContract):
     def get_input_embeddings(self):
         return self.language_model.model.embed_tokens
 
+    def get_embed_and_head(self):
+        embed = self.language_model.model.embed_tokens.embedding.value
+        head = embed if self.tie_word_embeddings else self.lm_head.embedding.value
+        return embed, head
+
     def __init__(
         self,
         config: PretrainedConfig,

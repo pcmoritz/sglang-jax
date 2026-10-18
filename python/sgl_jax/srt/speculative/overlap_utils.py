@@ -1,5 +1,7 @@
 import numpy as np
 
+from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
+
 
 def resolve_spec_prefill_token_ids(result):
     """Resolve prefill next-token ids prepared by the producer path."""
@@ -80,7 +82,11 @@ def can_merge_spec_non_overlap_prefill(enable_overlap, spec_algorithm) -> bool:
         not enable_overlap
         and spec_algorithm is not None
         and not spec_algorithm.is_none()
-        and (spec_algorithm.is_eagle3() or spec_algorithm.is_dflash_family())
+        and (
+            spec_algorithm.is_eagle3()
+            or spec_algorithm.is_dflash_family()
+            or spec_algorithm == SpeculativeAlgorithm.EAGLE
+        )
     )
 
 

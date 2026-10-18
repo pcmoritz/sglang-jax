@@ -32,7 +32,10 @@ from sgl_jax.srt.mem_cache.common import (
     alloc_token_slots,
 )
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
-from sgl_jax.srt.speculative.eagle_util import assign_req_to_token_pool
+from sgl_jax.srt.speculative.eagle_util import (
+    assign_req_to_token_pool,
+    verify_chain_greedy,
+)
 from sgl_jax.srt.speculative.overlap_utils import use_legacy_eagle3_non_overlap
 from sgl_jax.srt.speculative.spec_utils import (
     SIMULATED_ACCEPTANCE_CONFIG,
@@ -660,7 +663,13 @@ class EagleVerifyInput:
         is_all_greedy = sampling_info.is_all_greedy
         candidates = self.draft_token.reshape(bs, self.draft_token_num)
 
-        if is_all_greedy:
+        if is_all_greedy and self.custom_mask is None and jax.default_backend() == "tt":
+            # The tree kernel is a TPU Pallas kernel; a chain needs no tree walk.
+            with jax.set_mesh(mesh):
+                accept_index, accept_length, predict = verify_chain_greedy(
+                    self.draft_token, logits_output.next_token_logits, self.draft_token_num
+                )
+        elif is_all_greedy:
             with jax.set_mesh(mesh):
                 accept_index, accept_length, predict = verify_tree_greedy(
                     speculative_num_steps=self.spec_steps,

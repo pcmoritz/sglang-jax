@@ -271,6 +271,16 @@ class ModelConfig:
             self.hf_config.architectures[0] = "MiMoMTPForCausalLM"
 
         elif self.hf_config.architectures[0] in (
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5MoeForConditionalGeneration",
+        ):
+            # The draft is the checkpoint's MTP layers, all full attention.
+            self.hf_config.architectures[0] = "Qwen3_5ForCausalLMMTP"
+            text_cfg = self.hf_config.text_config
+            text_cfg.num_hidden_layers = int(getattr(text_cfg, "mtp_num_hidden_layers", 1))
+            text_cfg.layer_types = ["full_attention"] * text_cfg.num_hidden_layers
+
+        elif self.hf_config.architectures[0] in (
             "MiMoV2ForCausalLM",
             "MiMoV2FlashForCausalLM",
         ):

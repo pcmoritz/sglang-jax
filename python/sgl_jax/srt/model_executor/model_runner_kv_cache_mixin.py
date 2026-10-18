@@ -186,6 +186,15 @@ def request_owned_slots(server_args) -> int:
     return 1
 
 
+def verify_slots_per_slot(server_args) -> int:
+    """Verify slots per recurrent state slot: a speculative verify keeps the
+    state after each draft token but the last, which goes to the request's own
+    slot, until the accepted one is known."""
+    if server_args.speculative_algorithm is None:
+        return 0
+    return server_args.speculative_num_draft_tokens - 1
+
+
 def reservation_slots_per_request(server_args) -> int:
     """Slots the sizing back-cap RESERVES per concurrent request. The surplus
     over ``request_owned_slots`` is the implicit per-req snapshot headroom.
@@ -229,6 +238,7 @@ def _build_hybrid_pools(
     state_size: int | None = None,
     enable_recurrent_extra_buffer: bool = False,
     ping_pong_slots: int = 2,
+    verify_slots_per_slot: int = 0,
 ) -> tuple:
     """Build RecurrentStatePool + HybridReqToTokenPool + MemoryPools.
 
@@ -259,6 +269,7 @@ def _build_hybrid_pools(
         conv_dtype=state_params.dtype.conv,
         num_k_heads=state_params.num_k_heads,
         head_k_dim=state_params.head_k_dim,
+        verify_slots_per_rank=state_size // dp_size * verify_slots_per_slot,
     )
     hybrid_pool = HybridReqToTokenPool(
         size=max_num_reqs,
@@ -417,7 +428,10 @@ class ModelRunnerKVCacheMixin:
         cfg = self.linear_recurrent_config
         sa = self.server_args
         dp_size = self.dp_size
-        per_req_state = _per_req_state_bytes_from_config(cfg, self.attention_tp_size)
+        # Each slot comes with its verify slots under speculative decoding.
+        per_req_state = _per_req_state_bytes_from_config(cfg, self.attention_tp_size) * (
+            1 + verify_slots_per_slot(sa)
+        )
         factor = reservation_slots_per_request(sa)
         # Operator-set (priority 1/2) vs ratio-derived (priority 3) pool size.
         self.recurrent_size_user_supplied = sa.max_recurrent_state_size is not None
@@ -802,6 +816,7 @@ class ModelRunnerKVCacheMixin:
                 state_size=state_size,
                 enable_recurrent_extra_buffer=self.server_args.enable_recurrent_extra_buffer,
                 ping_pong_slots=_recurrent_ping_pong_slots(self.server_args),
+                verify_slots_per_slot=verify_slots_per_slot(self.server_args),
             )
         else:
             self.memory_pools = _build_non_hybrid_memory_pools(self.token_to_kv_pool)

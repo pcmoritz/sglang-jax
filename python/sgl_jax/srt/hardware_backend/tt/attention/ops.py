@@ -104,7 +104,10 @@ def _recurrent_call(name, state, output_shape, *operands, **attributes):
     )(state, *operands, **attributes)
 
 
-def causal_conv1d_update(state, value, weight, indices, initial):
+def causal_conv1d_update(state, value, weight, indices, initial, state_slots=None):
+    # With state_slots [B, T], each of the B states takes T steps over T rows
+    # of value, and the window after step t goes to state_slots[:, t].
+    slots = () if state_slots is None else (state_slots,)
     return _recurrent_call(
         "tt.causal_conv1d_update",
         state,
@@ -113,11 +116,15 @@ def causal_conv1d_update(state, value, weight, indices, initial):
         weight,
         indices,
         initial.astype(jnp.bfloat16),
+        *slots,
     )
 
 
-def gated_delta_decode(state, qkv, b, a, A_log, dt_bias, indices, initial):
+def gated_delta_decode(state, qkv, b, a, A_log, dt_bias, indices, initial, state_slots=None):
     # qkv is the flat convolution output: the query, key and value heads in turn.
+    # With state_slots [B, T], each of the B states takes T steps, over T rows
+    # each of qkv, b and a, and the state after step t goes to state_slots[:, t].
+    slots = () if state_slots is None else (state_slots,)
     return _recurrent_call(
         "tt.gated_delta_decode",
         state,
@@ -129,7 +136,13 @@ def gated_delta_decode(state, qkv, b, a, A_log, dt_bias, indices, initial):
         dt_bias.astype(jnp.float32),
         indices,
         initial.astype(jnp.bfloat16),
+        *slots,
     )
+
+
+def state_pool_copy(state, sources, targets):
+    """Copy slot sources[i] to slot targets[i] in place; slot 0 pairs are skipped."""
+    return _call("tt.state_pool_copy", state, sources, targets, input_output_aliases={0: 0})
 
 
 def state_pool_update(state, indices, updates):

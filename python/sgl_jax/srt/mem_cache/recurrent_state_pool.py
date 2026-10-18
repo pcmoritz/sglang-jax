@@ -8,6 +8,7 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
@@ -73,6 +74,30 @@ def recurrent_state_dtype() -> RecurrentStateDType:
     )
 
 
+def verify_state_slots(slots: np.ndarray, tokens: int, slots_per_rank: int) -> np.ndarray:
+    """[B, tokens] slots for the state after each of a verify's tokens.
+
+    The state after the last token goes to the request's own slot, the others
+    to the request's verify slots. Rows with slot 0 (padding) stay 0.
+    """
+    slots = np.asarray(slots, dtype=np.int32)
+    first = slots_per_rank + 1 + (slots - 1) * (tokens - 1)
+    states = first[:, None] + np.arange(tokens, dtype=np.int32)
+    states[:, -1] = slots
+    return np.where(slots[:, None] > 0, states, 0).astype(np.int32)
+
+
+def accepted_state_slots(
+    slots: np.ndarray, accepted: np.ndarray, tokens: int, slots_per_rank: int
+) -> np.ndarray:
+    """The verify slot holding each request's state after its accepted tokens,
+    or 0 where the request's own slot already holds it (copy_slots' no-op)."""
+    states = verify_state_slots(slots, tokens, slots_per_rank)
+    accepted = np.clip(np.asarray(accepted, dtype=np.int32), 1, tokens)
+    source = np.take_along_axis(states, accepted[:, None] - 1, axis=1)[:, 0]
+    return np.where(accepted < tokens, source, 0).astype(np.int32)
+
+
 @register_pytree_node_class
 class RecurrentStatePool:
 
@@ -93,11 +118,16 @@ class RecurrentStatePool:
         num_k_heads: int | None = None,
         head_k_dim: int | None = None,
         abstract: bool = False,
+        verify_slots_per_rank: int = 0,
     ):
         """`size` is the **global** number of valid slots across all DP ranks
         (mirrors MHATokenToKVPool.size semantics). Internally we partition by
         DP: each rank gets `size // dp_size` valid slots + 1 dummy slot at
         index 0, so total buffer slots = size + dp_size.
+
+        `verify_slots_per_rank` more slots per rank, after its valid ones, hold
+        the states a speculative verify computes after each draft token
+        (`verify_slot`). The allocator never hands them out.
         """
         state_dtype = recurrent_state_dtype()
         if temporal_dtype is None:
@@ -134,6 +164,7 @@ class RecurrentStatePool:
         self.num_k_heads = num_k_heads
         self.head_k_dim = head_k_dim
         self.conv_kernel_size = conv_kernel_size
+        self.verify_slots_per_rank = verify_slots_per_rank
 
         proj_v = num_heads * head_dim
         proj_k = num_k_heads * head_k_dim
@@ -170,8 +201,9 @@ class RecurrentStatePool:
         self.recurrent_buffers, self.conv_buffers = self._create_buffers(abstract=abstract)
 
     def _create_buffers(self, *, abstract: bool = False) -> tuple[list, list]:
-        recurrent_shape = (self.total_slots, self.num_heads, self.head_dim, self.head_dim)
-        conv_shape = (self.total_slots, self.proj_size, self.conv_kernel_size - 1)
+        slots = self.total_slots + self.dp_size * self.verify_slots_per_rank
+        recurrent_shape = (slots, self.num_heads, self.head_dim, self.head_dim)
+        conv_shape = (slots, self.proj_size, self.conv_kernel_size - 1)
         temporal_dtype = self.temporal_dtype
         conv_dtype = self.conv_dtype
 
@@ -313,6 +345,7 @@ class RecurrentStatePool:
             self.data_partition_axis,
             self.recurrent_sharding,
             self.conv_sharding,
+            self.verify_slots_per_rank,
         )
         return children, aux
 
@@ -336,6 +369,7 @@ class RecurrentStatePool:
             data_partition_axis,
             recurrent_sharding,
             conv_sharding,
+            verify_slots_per_rank,
         ) = aux_data
         obj = cls.__new__(cls)
         obj.linear_recurrent_layer_ids = list(linear_recurrent_layer_ids_tup)
@@ -363,6 +397,7 @@ class RecurrentStatePool:
         obj.data_partition_axis = data_partition_axis
         obj.recurrent_sharding = recurrent_sharding
         obj.conv_sharding = conv_sharding
+        obj.verify_slots_per_rank = verify_slots_per_rank
         new_recurrent, new_conv = children
         obj.recurrent_buffers = list(new_recurrent)
         obj.conv_buffers = [list(inner) for inner in new_conv]

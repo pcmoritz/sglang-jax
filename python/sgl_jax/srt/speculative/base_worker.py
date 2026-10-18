@@ -392,6 +392,18 @@ class BaseSpecWorker:
             self.draft_worker.draft_model_runner.rngs,
             self.mesh,
         )
+        # Recurrent layers kept their state after each draft token; keep the
+        # accepted one.
+        target_runner = self.target_worker.model_runner
+        keep_accepted = getattr(target_runner.attn_backend, "keep_accepted", None)
+        if keep_accepted is not None:
+            slots = np.asarray(model_worker_batch.recurrent_indices)
+            keep_accepted(
+                target_runner.memory_pools,
+                slots,
+                accept_length[: len(slots)],
+                spec_info.draft_token_num,
+            )
         legacy_non_overlap = use_legacy_eagle3_non_overlap(
             not self.server_args.disable_overlap_schedule,
             getattr(model_worker_batch, "spec_algorithm", None),
