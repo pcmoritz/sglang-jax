@@ -370,15 +370,18 @@ class TestNGramLayer(CustomTestCase):
         )
         self.tc, self.rng = tc, rng
 
-    def _ple(self, hidden, emb, *, decode, has_initial_state, cu=None, boundary=None):
+    def _ple(self, hidden, emb, *, decode, has_initial_state, cu=None, boundary=None, padding=0):
+        """``padding`` dummy requests (slot 0) follow the real one in the
+        per-request arrays but not in ``cu``, as TT's GDN backend trims it."""
+
         def put(x):
             return jax.device_put(jnp.asarray(x), NamedSharding(self.mesh, P("data")))
 
         tracked = boundary is not None
         metadata = LinearRecurrentAttnBackendMetadata(
             cu_q_lens=None if cu is None else put(np.asarray(cu, np.int32)),
-            recurrent_indices=put(np.array([self.SLOT], np.int32)),
-            has_initial_state=put(np.array([has_initial_state])),
+            recurrent_indices=put(np.array([self.SLOT] + [0] * padding, np.int32)),
+            has_initial_state=put(np.array([has_initial_state] + [False] * padding)),
             recurrent_track_indices=put(np.array([self.TRACK], np.int32)) if tracked else None,
             recurrent_track_mask=put(np.array([boundary])) if tracked else None,
         )
@@ -430,6 +433,19 @@ class TestNGramLayer(CustomTestCase):
             rtol=1e-5,
             atol=1e-5,
         )
+
+    def test_an_extend_reads_only_the_requests_cu_q_lens_covers(self):
+        """A backend may trim cu_q_lens to the live requests while the
+        per-request arrays keep the scheduler's padding."""
+        n = 5
+        hidden = self.rng.standard_normal((n, self.tc.hyper_hidden_size)).astype(np.float32)
+        emb = self.rng.standard_normal((n, self.tc.ple_embed_dim)).astype(np.float32)
+        out, state = self._ple(hidden, emb, decode=False, has_initial_state=False, cu=[0, n])
+        padded_out, padded_state = self._ple(
+            hidden, emb, decode=False, has_initial_state=False, cu=[0, n], padding=3
+        )
+        np.testing.assert_array_equal(np.asarray(padded_out), np.asarray(out))
+        np.testing.assert_array_equal(np.asarray(padded_state), np.asarray(state))
 
     def test_the_track_slot_takes_the_state_at_a_boundary(self):
         """Under --enable-recurrent-extra-buffer the metadata names a track slot

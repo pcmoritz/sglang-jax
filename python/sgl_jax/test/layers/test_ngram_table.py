@@ -163,23 +163,6 @@ class TestLoadAndGather(CustomTestCase):
             with self.assertRaises(ValueError):
                 table.gather(np.zeros((4, HEADS + 1), np.int32))
 
-    def test_gather_is_the_same_single_and_multi_threaded(self):
-        """The row-count threshold picks the thread count; both paths must agree."""
-        from sgl_jax.srt.layers import ngram_table as mod
-
-        params = _params()
-        with tempfile.TemporaryDirectory() as d:
-            table = NGramTable.from_safetensors(_write_checkpoint(d, params), _Config())
-            rng = np.random.default_rng(1)
-            # Enough rows that _thread_count returns > 1.
-            ids = rng.integers(0, table.rows, size=(4096, HEADS)).astype(np.int32)
-            self.assertGreater(mod._thread_count(ids.size), 1)
-            threaded = table.gather(ids).view(np.uint16).copy()
-            with patch.object(mod, "_ROWS_PER_THREAD", 1 << 40):
-                self.assertEqual(mod._thread_count(ids.size), 1)
-                single = table.gather(ids).view(np.uint16).copy()
-            np.testing.assert_array_equal(threaded, single)
-
     def test_checkpoint_and_cache_validation(self):
         params = _params()
         for bad in (
@@ -354,7 +337,8 @@ class TestSchedulerHandoff(CustomTestCase):
                         "sgl_jax.srt.managers.schedule_batch.get_ngram_table", return_value=table
                     ):
                         embeddings = batch._merge_ngram_ple(per_dp, len(ids), ids)
-                    want = table.data[expected_ids].reshape(len(ids), PLE_EMBED_DIM)
+                    rows = np.concatenate(table.shards)
+                    want = rows[expected_ids].reshape(len(ids), PLE_EMBED_DIM)
                     np.testing.assert_array_equal(embeddings.view(np.uint16), want)
                     self._handoff(batch, ids, embeddings)
 

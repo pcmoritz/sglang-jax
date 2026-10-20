@@ -422,6 +422,13 @@ class NGramEmbedding(nnx.Module):
         def _local(
             x_l, state_l, weight_l, indices_l, init_l, cu_l, track_indices_l=None, track_mask_l=None
         ):
+            # A backend may trim cu_seqlens to the live requests (TT's GDN
+            # backend does) while the per-request arrays keep the scheduler's
+            # padding; read only the requests cu_seqlens covers.
+            batch = cu_l.shape[0] - 1
+            indices_l, init_l = indices_l[:batch], init_l[:batch]
+            if track_indices_l is not None:
+                track_indices_l, track_mask_l = track_indices_l[:batch], track_mask_l[:batch]
             y, new_state = ngram_conv_prefill(
                 x=x_l.T,  # [T, C] -> [C, T], the kernels are channel-first
                 weight=weight_l,

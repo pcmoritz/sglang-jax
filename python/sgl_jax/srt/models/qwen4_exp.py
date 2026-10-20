@@ -18,6 +18,8 @@ What differs:
 
 from __future__ import annotations
 
+import warnings
+
 import jax
 import jax.numpy as jnp
 from flax import nnx
@@ -176,6 +178,12 @@ class Qwen4ExpAttention(nnx.Module):
         backend = forward_batch.attn_backend
         backend = getattr(backend, "full_attn_backend", backend)
         slot_map = getattr(backend, "full_slot", None)
+        if slot_map is None:  # The default warnings filter shows this once.
+            limit = self.indexer.budget + self.indexer.compress_ratio - 1
+            warnings.warn(
+                f"{type(backend).__name__} lacks QSA: dense attention is exact up to {limit} tokens",
+                stacklevel=2,
+            )
         if slot_map is None or self.layer_id not in slot_map:
             return None
         indexer_q, raw_key = self.indexer.project(
@@ -629,7 +637,7 @@ def _ple_mappings(src: str, dst: str, text_cfg) -> dict:
 
 
 def _install_ngram_table(model_config) -> None:
-    """Stream the N-gram table into host memory for the scheduler's lookup.
+    """Install the N-gram table for the scheduler's lookup.
 
     The table stays off the device (``ngram_table.py``): the scheduler gathers
     each batch's rows on the host and only those reach the model.

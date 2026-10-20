@@ -729,6 +729,10 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module, InModelMultimodalContract):
     def _moe_gate_up(inputs):
         return tuple(value.transpose(0, 2, 1) for value in np.split(inputs[0], 2, axis=1))
 
+    @staticmethod
+    def _moe_down(inputs):
+        return (inputs[0].transpose(0, 2, 1),)
+
     def _weight_mappings(self, hf_config):
         """``(mappings, visual_skip_patterns, mtp_skip_patterns)`` for this
         checkpoint layout."""
@@ -771,6 +775,10 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module, InModelMultimodalContract):
                 source = f"model.language_model.layers.{i}.mlp.experts.gate_up_proj"
                 mappings[source].sources = (source,)
                 mappings[source].host_recipe = self._moe_gate_up
+                source = f"model.language_model.layers.{i}.mlp.experts.down_proj"
+                mappings[source].sources = (source,)
+                mappings[source].transpose_axes = None
+                mappings[source].host_recipe = self._moe_down
         loader = WeightLoader(self, model_config, self.mesh, dtype=self.dtype)
         if self.visual is not None:
             vision_mappings = Qwen3VLForConditionalGeneration.create_vision_weight_mappings(
