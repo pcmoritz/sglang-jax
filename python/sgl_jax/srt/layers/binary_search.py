@@ -315,6 +315,9 @@ def topp_mask(logits: jax.Array, p: jax.Array, replace_val: float) -> jax.Array:
 
     # threshold: [batch...]
     threshold = float32_bsearch(batch_shape, predicate)
+    # A row asking for the whole mass keeps every token, including the tail the
+    # search can miss when the summed mass rounds below 1.
+    threshold = jnp.where(p >= 1.0, 0.0, threshold)
     # threshold: [batch..., 1]
     threshold = lax.expand_dims(threshold, (threshold.ndim,))
     return jnp.where(probs >= threshold, logits, jnp.full_like(logits, replace_val))

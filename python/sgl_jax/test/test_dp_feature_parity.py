@@ -19,15 +19,16 @@ from sgl_jax.srt.managers.schedule_batch import Req, ScheduleBatch
 from sgl_jax.srt.managers.scheduler_output_processor_mixin import _collect_hidden_states
 from sgl_jax.srt.managers.tokenizer_manager import TokenizerManager
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
 
 
-def make_req(rid, *, hidden=False, lora=None):
+def make_req(rid, *, hidden=False, lora=None, **sampling):
     return Req(
         str(rid),
         None,
         [1, 2, 3, 4],
-        SamplingParams(max_new_tokens=4),
+        SamplingParams(max_new_tokens=4, **sampling),
         return_hidden_states=hidden,
         lora_id=lora,
     )
@@ -148,6 +149,59 @@ def test_lora_adapter_and_token_slots(counts, mode):
     )
     want = 2 * np.array(expected) * np.array(mwb.lora_scalings)
     np.testing.assert_allclose(actual, np.repeat(want[:, None], 2, axis=1))
+
+
+_FILTER_FLAGS = ("need_top_p_sampling", "need_top_k_sampling", "need_min_p_sampling")
+_FILTER_CASES = [
+    ({"top_p": 0.9}, "need_top_p_sampling"),
+    ({"top_k": 20}, "need_top_k_sampling"),
+    ({"temperature": 0.0}, "need_top_k_sampling"),  # greedy is top_k = 1
+    ({"min_p": 0.1}, "need_min_p_sampling"),
+]
+
+
+@pytest.mark.parametrize("counts", [[1, 1], [0, 2], [2, 0, 1, 1]])
+@pytest.mark.parametrize("sampling, flag", [({}, None)] + _FILTER_CASES)
+def test_sampling_filter_flags_survive_the_dp_merge(counts, sampling, flag):
+    # The sampler runs the top-p, top-k and min-p filters only when these say a
+    # request needs them, so a flag lost in the merge drops that filter for the
+    # whole batch. One request, on the last non-empty rank, sets the parameter.
+    last = max(r for r, n in enumerate(counts) if n)
+    reqs = [
+        [make_req(f"{r}-{i}", **(sampling if (r, i) == (last, 0) else {})) for i in range(n)]
+        for r, n in enumerate(counts)
+    ]
+    batch = make_batch(reqs)
+    for info in batch.reqs_info:
+        if info.reqs:  # as prepare_for_extend leaves each rank
+            info.seq_lens = np.full(len(info.reqs), 4)
+            info.sampling_info = SamplingBatchInfo.from_schedule_batch(info, 64)
+    merged = batch._merge_sampling_info(3, len(counts) * 3)
+    for name in _FILTER_FLAGS:
+        assert getattr(merged, name) == (name == flag), name
+
+
+@pytest.mark.parametrize("sampling, flag", _FILTER_CASES)
+def test_sampling_filter_flags_clear_when_the_request_finishes(sampling, flag):
+    # The request that set the parameter finishes; the one left sets nothing,
+    # so the sampler can skip that filter again.
+    batch = make_batch([[make_req("0-0", **sampling), make_req("0-1")]])
+    info = batch.reqs_info[0]
+    info.sampling_info = SamplingBatchInfo.from_schedule_batch(info, 64)
+    assert getattr(info.sampling_info, flag)
+    info.sampling_info.filter_batch(np.array([1]))
+    for name in _FILTER_FLAGS:
+        assert not getattr(info.sampling_info, name), name
+
+
+def test_all_greedy_when_the_sampled_request_finishes():
+    # The sampled request finishes; the greedy one left can take argmax again.
+    batch = make_batch([[make_req("0-0"), make_req("0-1", temperature=0.0)]])
+    info = batch.reqs_info[0]
+    info.sampling_info = SamplingBatchInfo.from_schedule_batch(info, 64)
+    assert not info.sampling_info.is_all_greedy
+    info.sampling_info.filter_batch(np.array([1]))
+    assert info.sampling_info.is_all_greedy
 
 
 class SingleTokenGrammar:

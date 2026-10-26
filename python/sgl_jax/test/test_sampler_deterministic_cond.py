@@ -48,11 +48,12 @@ _COND_AVAL_ERROR = "cond branches must have equal output types"
 
 
 def _seeded_args(mesh, bs, vocab, seed_value=42):
-    """Build the 10-tuple `args` consumed by the sampler leaf helpers.
+    """Build the 12-tuple `args` consumed by the sampler leaf helpers.
 
     Layout (see Sampler._regular_sampling):
         (logits, probs, top_ks, top_ps, min_ps, positions, temperatures,
-         sampling_seeds, need_min_p_sampling, rng)
+         sampling_seeds, need_min_p_sampling, need_top_p_sampling,
+         need_top_k_sampling, rng)
     Row-major tensors are sharded P("data", None); per-row vectors P("data").
     `sampling_seeds` is non-None so the seeded branch is selected -- the bug path.
     """
@@ -71,6 +72,8 @@ def _seeded_args(mesh, bs, vocab, seed_value=42):
         jax.device_put(jnp.ones((bs, 1), dtype=jnp.float32), row2d),
         jax.device_put(jnp.full((bs,), seed_value, dtype=jnp.int32), row1d),
         False,  # need_min_p_sampling
+        False,  # need_top_p_sampling: top_p is 1
+        True,  # need_top_k_sampling: top_k is the vocab size, not TOP_K_ALL
         random.PRNGKey(0),
     )
 

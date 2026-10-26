@@ -2604,6 +2604,9 @@ class ScheduleBatch:
         has_sampling_seeds = False
         vocab_size = 0
         is_all_greedy = True
+        # Each tells the sampler whether a filter has to run; any rank needing one
+        # needs it for the merged batch.
+        need_top_p_sampling = need_top_k_sampling = need_min_p_sampling = False
 
         for dp_rank in range(self.dp_size):
             info = self.reqs_info[dp_rank]
@@ -2623,6 +2626,9 @@ class ScheduleBatch:
 
             if not info.sampling_info.is_all_greedy:
                 is_all_greedy = False
+            need_top_p_sampling |= dp_sampling.need_top_p_sampling
+            need_top_k_sampling |= dp_sampling.need_top_k_sampling
+            need_min_p_sampling |= dp_sampling.need_min_p_sampling
 
             # Copy sampling parameters
             temperatures[offset_bs : offset_bs + dp_bs] = dp_sampling.temperatures[:dp_bs]
@@ -2667,6 +2673,9 @@ class ScheduleBatch:
             min_ps=min_ps,
             vocab_size=vocab_size,
             is_all_greedy=is_all_greedy,
+            need_top_p_sampling=need_top_p_sampling,
+            need_top_k_sampling=need_top_k_sampling,
+            need_min_p_sampling=need_min_p_sampling,
             sampling_seeds=sampling_seeds if has_sampling_seeds else None,
             linear_penalty=linear_penalty,
             grammars=grammars,
