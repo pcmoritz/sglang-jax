@@ -27,6 +27,29 @@ from jax import lax
 from jax import numpy as jnp
 
 
+def _dense_row_width(x: jax.Array) -> int:
+    """The width w of a [batch, vocab / w, w] view for searching x on Tenstorrent,
+    or 0 to search x as on other backends.
+
+    Tenstorrent computes on 32 x 32 tiles. A [batch, vocab] tensor with a small
+    batch fills only batch rows of each tile, and moving the vocab axis first, as
+    the searches do for TPU, makes it a single tile column whose reductions run on
+    one core. Viewing each row as [vocab / w, w] fills the tiles, and reducing over
+    both axes splits each reduction into two stages. w is the widest 32 * 2^k that
+    divides the vocab up to about its square root, which balances the stages.
+    """
+    if x.ndim != 2 or jax.devices()[0].platform != "tt":
+        return 0
+    vocab = x.shape[1]
+    width = 0
+    candidate = 32
+    while candidate * candidate <= vocab:
+        if vocab % candidate == 0:
+            width = candidate
+        candidate *= 2
+    return width
+
+
 def int32_bsearch(batch_shape: Sequence[int], predicate: Callable[[jax.Array], jax.Array]):
     """Batched binary search over int32 values.
 
@@ -185,8 +208,11 @@ def topk_mask(x: jax.Array, k: jax.Array, replace_val: float) -> jax.Array:
     batch_shape = tuple(list(x.shape)[:-1])  # [batch...]
 
     x_for_loop = x
-    reduce_axis = x.ndim - 1
-    if x.ndim > 1:
+    reduce_axis = (x.ndim - 1,)
+    if width := _dense_row_width(x):
+        x_for_loop = x.reshape(x.shape[0], x.shape[1] // width, width)
+        reduce_axis = (1, 2)
+    elif x.ndim > 1:
         # We're going to be doing 32 reductions over 'reduce_axis'. Generally,
         # reductions over the last dimension are the most expensive, because they
         # involve reducing across vector lanes, which is often not efficient. So
@@ -196,7 +222,7 @@ def topk_mask(x: jax.Array, k: jax.Array, replace_val: float) -> jax.Array:
         # Normally the XLA compiler would automatically perform this optimization,
         # but it doesn't yet see through loops to do so. So we do it ourselves.
         x_for_loop = jnp.swapaxes(x_for_loop, -1, -2)
-        reduce_axis = x.ndim - 2
+        reduce_axis = (x.ndim - 2,)
 
     # x: [batch..., vocab_size, batch]
     def predicate(threshold):
@@ -207,7 +233,7 @@ def topk_mask(x: jax.Array, k: jax.Array, replace_val: float) -> jax.Array:
         # smallest float32 for which the predicate is False.
         threshold = -threshold
 
-        threshold = lax.expand_dims(threshold, (reduce_axis,))
+        threshold = lax.expand_dims(threshold, reduce_axis)
         # threshold: [batch..., 1, last_batch]
 
         # count_ge: [batch...]
@@ -253,15 +279,18 @@ def topp_mask(logits: jax.Array, p: jax.Array, replace_val: float) -> jax.Array:
     probs = jax.nn.softmax(logits, axis=-1)
 
     probs_for_reduction = probs
-    reduce_axis = probs_for_reduction.ndim - 1
-    if probs_for_reduction.ndim > 1:
+    reduce_axis = (probs_for_reduction.ndim - 1,)
+    if width := _dense_row_width(probs):
+        probs_for_reduction = probs.reshape(probs.shape[0], probs.shape[1] // width, width)
+        reduce_axis = (1, 2)
+    elif probs_for_reduction.ndim > 1:
         # We're going to be doing 33 reductions over 'reduce_axis'. Generally,
         # reductions over the last dimension are the most expensive, because they
         # involve reducing across vector lanes, which is often not efficient. So
         # we transpose the reduce_axis to be the second-last dimension, to avoid
         # this inefficiency.
         probs_for_reduction = jnp.swapaxes(probs_for_reduction, -1, -2)
-        reduce_axis = probs_for_reduction.ndim - 2
+        reduce_axis = (probs_for_reduction.ndim - 2,)
 
     # As we increase the threshold, the probability mass decreases, and the number
     # selected decreases.
@@ -273,7 +302,7 @@ def topp_mask(logits: jax.Array, p: jax.Array, replace_val: float) -> jax.Array:
     # probs_for_reduction: [batch..., vocab_size, batch]
     def predicate(threshold):
         # threshold: [batch...]
-        threshold = lax.expand_dims(threshold, (reduce_axis,))
+        threshold = lax.expand_dims(threshold, reduce_axis)
         # threshold: [batch..., 1, last_batch]
 
         # count_ge: [batch...]
