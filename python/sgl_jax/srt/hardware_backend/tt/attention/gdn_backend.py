@@ -159,13 +159,16 @@ class TTGDNAttnBackend(GDNAttnBackend):
     def _verify_metadata(self, batch):
         """Each request verifies a linear chain of draft tokens."""
         size = len(batch.seq_lens)
-        slots, initial = (
-            np.pad(np.asarray(value)[:size], (0, max(0, size - len(value))))
-            for value in (batch.recurrent_indices, batch.has_initial_state)
-        )
+        # Padding rows and precompile's dummy batches, which come without
+        # recurrent slots, use slot 0, which the kernels never write. A verified
+        # request always has a state.
+        slots = np.zeros(size, dtype=np.int32)
+        if batch.recurrent_indices is not None:
+            indices = np.asarray(batch.recurrent_indices)[:size]
+            slots[: len(indices)] = indices
         meta = TTGDNMetadata(verify_tokens=batch.spec_info_padded.draft_token_num)
         meta.recurrent_indices, meta.has_initial_state = device_array(
-            (slots.astype(np.int32), initial.astype(bool)),
+            (slots, np.ones(size, dtype=bool)),
             sharding=NamedSharding(self.mesh, P("data")),
         )
         return meta

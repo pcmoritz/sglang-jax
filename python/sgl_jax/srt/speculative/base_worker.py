@@ -393,10 +393,10 @@ class BaseSpecWorker:
             self.mesh,
         )
         # Recurrent layers kept their state after each draft token; keep the
-        # accepted one.
+        # accepted one. Precompile's dummy batches have no recurrent slots.
         target_runner = self.target_worker.model_runner
         keep_accepted = getattr(target_runner.attn_backend, "keep_accepted", None)
-        if keep_accepted is not None:
+        if keep_accepted is not None and model_worker_batch.recurrent_indices is not None:
             slots = np.asarray(model_worker_batch.recurrent_indices)
             keep_accepted(
                 target_runner.memory_pools,
