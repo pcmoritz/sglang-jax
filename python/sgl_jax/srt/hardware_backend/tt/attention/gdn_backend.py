@@ -72,28 +72,25 @@ def _per_device(forward):
 
 
 def verify_state_slots(slots, tokens: int, slots_per_rank: int):
-    """[B, tokens] slots for the state after each of a verify's tokens, for
-    NumPy or JAX slots.
+    """[B, tokens] slots for the state after each of a verify's tokens.
 
     The state after the last token goes to the request's own slot, the others
     to the request's verify slots. Rows with slot 0 (padding) stay 0.
     """
-    xp = jnp if isinstance(slots, jax.Array) else np
-    steps = xp.arange(tokens, dtype=np.int32)
+    steps = jnp.arange(tokens, dtype=jnp.int32)
     first = slots_per_rank + 1 + (slots - 1) * (tokens - 1)
-    states = xp.where(steps == tokens - 1, slots[:, None], first[:, None] + steps)
-    return xp.where(slots[:, None] > 0, states, 0).astype(np.int32)
+    states = jnp.where(steps == tokens - 1, slots[:, None], first[:, None] + steps)
+    return jnp.where(slots[:, None] > 0, states, 0).astype(jnp.int32)
 
 
 def accepted_state_slots(slots, accepted, tokens: int, slots_per_rank: int):
     """The verify slot holding each request's state after its `accepted`
     tokens (of `tokens`), or 0 where the request's own slot already holds it
     or the row is padding."""
-    xp = jnp if isinstance(slots, jax.Array) else np
-    states = verify_state_slots(slots, tokens, slots_per_rank)
-    last = xp.clip(accepted, 1, tokens)[:, None] - 1
-    source = xp.where(xp.arange(tokens) == last, states, 0).sum(axis=1)
-    return xp.where(last[:, 0] < tokens - 1, source, 0).astype(np.int32)
+    count = jnp.clip(accepted, 1, tokens)
+    first = slots_per_rank + 1 + (slots - 1) * (tokens - 1)
+    source = first + count - 1
+    return jnp.where((slots > 0) & (count < tokens), source, 0).astype(jnp.int32)
 
 
 @functools.cache
@@ -270,9 +267,9 @@ class TTGDNAttnBackend(GDNAttnBackend):
         """Run each request's draft tokens and keep the state after each one.
 
         The state after token t goes to slot ``states[:, t]``: the request's
-        own slot for the last token, its verify slots (RecurrentStatePool's
-        ``verify_state_slots``) for the others. Once the accepted count is
-        known, the speculative worker copies its state to the request's slot.
+        own slot for the last token, its verify slots (``verify_state_slots``)
+        for the others. Once the accepted count is known, the speculative
+        worker copies its state to the request's slot.
         """
         tokens = meta.verify_tokens
         indices, initial = meta.recurrent_indices, meta.has_initial_state

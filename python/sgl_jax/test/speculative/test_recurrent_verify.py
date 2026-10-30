@@ -1,7 +1,6 @@
 """Speculative verify of hybrid recurrent models on Tenstorrent: the verify-slot
 layout that keeps each request's state after its accepted tokens."""
 
-import jax.numpy as jnp
 import numpy as np
 
 from sgl_jax.srt.hardware_backend.tt.attention.gdn_backend import (
@@ -13,7 +12,7 @@ from sgl_jax.srt.hardware_backend.tt.attention.gdn_backend import (
 def test_verify_state_slots_layout():
     slots_per_rank, tokens = 4, 4
     slots = np.array([3, 1, 0, 2])
-    states = verify_state_slots(slots, tokens, slots_per_rank)
+    states = np.asarray(verify_state_slots(slots, tokens, slots_per_rank))
     # The last token's state goes to the request's own slot, padding stays 0.
     np.testing.assert_array_equal(states[:, -1], slots)
     assert not states[2].any()
@@ -35,15 +34,14 @@ def test_accepted_state_slots():
     assert source[0] == states[0, 0] and source[3] == states[3, 2]
 
 
-def test_slot_layout_on_device_matches_host():
-    # The verify computes the slots on device, keep_accepted from device counts.
-    slots, accepted = np.array([3, 1, 0, 2], np.int32), np.array([1, 4, 0, 3], np.int32)
-    for host, device in (
-        (verify_state_slots(slots, 4, 4), verify_state_slots(jnp.asarray(slots), 4, 4)),
-        (
-            accepted_state_slots(slots, accepted, 4, 4),
-            accepted_state_slots(jnp.asarray(slots), jnp.asarray(accepted), 4, 4),
-        ),
-    ):
-        np.testing.assert_array_equal(host, np.asarray(device))
-
+def test_accepted_state_slots_match_the_layout():
+    # Every accept count, including out-of-range ones, against the verify layout.
+    slots_per_rank = 5
+    slots = np.array([0, 1, 2, 3, 4, 5])
+    for tokens in range(1, 9):
+        states = np.asarray(verify_state_slots(slots, tokens, slots_per_rank))
+        for accepted in range(-1, tokens + 2):
+            count = min(max(accepted, 1), tokens)
+            expected = np.where((slots > 0) & (count < tokens), states[:, count - 1], 0)
+            source = accepted_state_slots(slots, np.full_like(slots, accepted), tokens, slots_per_rank)
+            np.testing.assert_array_equal(np.asarray(source), expected)
