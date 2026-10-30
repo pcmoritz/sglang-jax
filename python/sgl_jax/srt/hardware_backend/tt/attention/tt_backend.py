@@ -105,9 +105,10 @@ class TTAttentionMetadata:
 
     # The fused speculative JITs start from each request's page table
     # (get_eagle_base_metadata) and add the rest on device.
-    def for_chain(self, seq_lens: jax.Array, tokens: int) -> "TTAttentionMetadata":
+    def for_chain(self, seq_lens: jax.Array, tokens: int) -> TTAttentionMetadata:
         """Metadata for `tokens` query tokens per request (verify, draft
         extend); requests with a zero length are padding."""
+
         def repeat(x):
             return jnp.repeat(x, tokens, axis=0, out_sharding=jax.typeof(x).sharding)
 
@@ -116,7 +117,7 @@ class TTAttentionMetadata:
             positions=repeat(jnp.where(seq_lens > 0, seq_lens, -1)),
         )
 
-    def for_step(self, positions: jax.Array) -> "TTAttentionMetadata":
+    def for_step(self, positions: jax.Array) -> TTAttentionMetadata:
         """Metadata for one token per request at `positions` (a draft step);
         position 0 marks padding."""
         return TTAttentionMetadata(
@@ -252,11 +253,25 @@ class TTAttention(AttentionBackend):
 
     def get_eagle_base_metadata(self, batch: ModelWorkerBatch) -> TTAttentionMetadata:
         """Each request's page table, which the fused speculative JITs extend
-        on device (TTAttentionMetadata.for_chain and for_step)."""
-        metadata = TTAttentionMetadata()
-        metadata.page_table = device_array(
-            self._eagle_page_table(batch), sharding=NamedSharding(self.mesh, P("data"))
+        on device (TTAttentionMetadata.for_chain and for_step).
+
+        cache_loc holds each live request's allocation, which includes the
+        pages reserved for its draft tokens. allocate_lens comes per batch row
+        or per live request.
+        """
+        lengths = np.asarray(batch.seq_lens)
+        live = lengths > 0
+        allocate_lens = np.asarray(batch.spec_info_padded.allocate_lens)
+        if len(allocate_lens) == len(lengths):
+            allocate_lens = allocate_lens[live]
+        allocated = np.zeros(len(lengths), dtype=np.int64)
+        allocated[live] = allocate_lens
+        page_table = _pad_page_table(
+            _page_table(np.asarray(batch.cache_loc, dtype=np.int32), allocated, self.page_size),
+            users=len(lengths),
         )
+        metadata = TTAttentionMetadata()
+        metadata.page_table = device_array(page_table, sharding=NamedSharding(self.mesh, P("data")))
         return metadata
 
     def get_eagle_multi_step_metadata(self, batch: ModelWorkerBatch):
@@ -265,34 +280,16 @@ class TTAttention(AttentionBackend):
         Step i writes and attends up to position seq_len - 1 + i, the next
         position after the request's verified tokens.
         """
-        page_table = self._eagle_page_table(batch)
+        page_table = self.get_eagle_base_metadata(batch).page_table
         lengths = np.asarray(batch.seq_lens, dtype=np.int32)
-        sharding = NamedSharding(self.mesh, P("data"))
-        steps = []
-        for step in range(batch.speculative_num_steps):
-            metadata = TTAttentionMetadata()
-            positions = np.where(lengths > 0, lengths - 1 + step, -1).astype(np.int32)
-            metadata.page_table, metadata.positions = device_array(
-                (page_table, positions), sharding=sharding
-            )
-            steps.append(metadata)
-        return steps
-
-    def _eagle_page_table(self, batch: ModelWorkerBatch) -> np.ndarray:
-        """Page tables from an EAGLE batch's cache_loc, which holds each live
-        request's pages in batch order, the request's allocation each."""
-        lengths = np.asarray(batch.seq_lens)
-        allocated = np.asarray(batch.spec_info_padded.allocate_lens)
-        live = np.flatnonzero(lengths > 0)
-        if len(allocated) != len(live):
-            allocated = allocated[live]
-        pages = np.asarray(batch.cache_loc, dtype=np.int32)[:: self.page_size] // self.page_size
-        counts = cdiv(allocated, self.page_size)
-        starts = np.cumsum(counts) - counts
-        table = np.zeros((len(lengths), max(16, len(pages))), dtype=np.int32)
-        for row, start, count in zip(live, starts, counts):
-            table[row, :count] = pages[start : start + count]
-        return table
+        positions = device_array(
+            [
+                np.where(lengths > 0, lengths - 1 + step, -1).astype(np.int32)
+                for step in range(batch.speculative_num_steps)
+            ],
+            sharding=NamedSharding(self.mesh, P("data")),
+        )
+        return [TTAttentionMetadata(page_table=page_table, positions=step) for step in positions]
 
     def _decode_metadata(self, batch: ModelWorkerBatch) -> TTAttentionMetadata:
         sequence_lengths = np.asarray(batch.seq_lens, dtype=np.int32)[: batch.real_bs]
