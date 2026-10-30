@@ -2119,11 +2119,13 @@ class ServerArgs:
                 and self.speculative_eagle_topk == 1
                 and self.speculative_num_draft_tokens == self.speculative_num_steps + 1
             )
+            # The fused recursive draft: EAGLE3 on FlashAttention, or EAGLE (a
+            # checkpoint's MTP layer) on Tenstorrent.
             supports_eagle3_overlap = (
-                self.speculative_algorithm == "EAGLE3"
+                (self.speculative_algorithm, self.attention_backend)
+                in (("EAGLE3", "fa"), ("EAGLE", "tt"))
                 and self.speculative_eagle_topk == 1
                 and self.speculative_num_draft_tokens == self.speculative_num_steps + 1
-                and self.attention_backend == "fa"
             )
             supports_dflash_overlap = (
                 self.speculative_algorithm in ("DFLASH", "DSPARK")

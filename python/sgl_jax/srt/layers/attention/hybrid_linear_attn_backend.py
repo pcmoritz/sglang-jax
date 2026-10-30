@@ -167,6 +167,15 @@ class HybridLinearAttnBackendMetadata:
     def tree_unflatten(cls, aux_data, children):
         return cls(full_attn_metadata=children[0], linear_attn_metadata=children[1])
 
+    # A fused speculative JIT rebuilds the full-attention metadata on device;
+    # the linear layers' metadata holds no positions.
+    def for_chain(self, seq_lens, tokens: int):
+        full = self.full_attn_metadata.for_chain(seq_lens, tokens)
+        return type(self)(full, self.linear_attn_metadata)
+
+    def for_step(self, positions):
+        return type(self)(self.full_attn_metadata.for_step(positions), self.linear_attn_metadata)
+
 
 @dataclass
 class HybridLinearAttnBackend(AttentionBackend):
@@ -197,21 +206,25 @@ class HybridLinearAttnBackend(AttentionBackend):
             linear_attn_metadata=self.linear_attn_backend.get_forward_metadata(batch),
         )
 
-    def get_eagle_forward_metadata(self, batch, **kwargs):
+    @property
+    def page_size(self) -> int:
+        return self.full_attn_backend.page_size
+
+    def get_eagle_base_metadata(self, batch):
         return HybridLinearAttnBackendMetadata(
-            full_attn_metadata=self.full_attn_backend.get_eagle_forward_metadata(batch, **kwargs),
+            full_attn_metadata=self.full_attn_backend.get_eagle_base_metadata(batch),
             linear_attn_metadata=self.linear_attn_backend.get_forward_metadata(batch),
         )
 
-    def keep_accepted(self, memory_pools, slots, accepted, tokens: int) -> None:
-        """After a speculative verify of `tokens` draft tokens per request,
+    def keep_accepted(self, memory_pools, accepted, tokens: int) -> None:
+        """After the current speculative verify of `tokens` tokens per request,
         keep each request's recurrent state after its `accepted` tokens."""
         keep = getattr(self.linear_attn_backend, "keep_accepted", None)
         if keep is None:
             raise NotImplementedError(
                 f"{type(self.linear_attn_backend).__name__} does not support speculative verify"
             )
-        keep(memory_pools.recurrent_state_pool, slots, accepted, tokens)
+        keep(memory_pools.recurrent_state_pool, accepted, tokens)
 
     @property
     def token_to_kv_pool_class(self):

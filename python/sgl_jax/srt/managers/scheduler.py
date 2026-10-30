@@ -2011,7 +2011,7 @@ class Scheduler(
                 elif (
                     self.enable_overlap
                     and self.spec_algorithm is not None
-                    and self.spec_algorithm.is_eagle3()
+                    and self.spec_algorithm.drafts_recursively()
                     and any(
                         info.reqs
                         and (

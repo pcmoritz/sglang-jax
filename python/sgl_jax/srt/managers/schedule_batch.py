@@ -2842,7 +2842,6 @@ class ScheduleBatch:
             tree_cache=self.tree_cache,
             mrope_positions=None,
             recurrent_indices=recurrent_indices,
-            has_initial_state=np.ones(total_bs, dtype=np.bool_),
         )
         return model_worker_batch
 

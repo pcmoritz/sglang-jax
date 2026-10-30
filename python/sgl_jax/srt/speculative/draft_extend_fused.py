@@ -72,6 +72,13 @@ def _count_pjit_cpp_cache_miss():
         yield count
 
 
+def _prepare_model_state(attn_backend, leaves):
+    """The backend's view of the model weights, as its forward JIT prepares
+    them (e.g. Tenstorrent's weight data types)."""
+    prepare = getattr(attn_backend, "prepare_model_state", None)
+    return leaves if prepare is None else prepare(leaves)
+
+
 def _active_dp_slot_mask(batch, total_bs: int) -> np.ndarray:
     mask = np.zeros(total_bs, dtype=bool)
     per_dp_bs = int(getattr(batch, "per_dp_bs_size", total_bs))
@@ -721,6 +728,9 @@ def _make_target_verify_metadata(
     page_size: int,
     dp_size: int,
 ):
+    if hasattr(old_metadata, "for_chain"):
+        # TT metadata (and hybrid metadata around it) rebuilds itself.
+        return old_metadata.for_chain(verify_seq_lens, speculative_num_draft_tokens)
     from sgl_jax.srt.layers.attention.flashattention_backend import (
         FlashAttentionMetadata,
     )
@@ -788,7 +798,11 @@ def _make_draft_extend_metadata(
     query_lens=None,
     page_size: int,
     dp_size: int,
+    tokens: int | None = None,
 ):
+    if hasattr(old_metadata, "for_chain"):
+        # TT metadata rebuilds itself; `tokens` is the query tokens per request.
+        return old_metadata.for_chain(draft_seq_lens, tokens)
     from sgl_jax.srt.layers.attention.flashattention_backend import (
         FlashAttentionMetadata,
     )
@@ -855,6 +869,9 @@ def _make_eagle3_decode_metadata(
     dp_size: int,
 ):
     """Build one-token recurrent EAGLE3 decode metadata on device."""
+    if hasattr(old_metadata, "for_step"):
+        # TT metadata rebuilds itself; the decode positions are seq_lens.
+        return old_metadata.for_step(seq_lens)
     from sgl_jax.srt.layers.attention.flashattention_backend import (
         FlashAttentionMetadata,
     )
@@ -926,8 +943,9 @@ def _map_eagle3_token_ids(token_ids, hot_token_ids):
     return hot_token_ids[token_ids]
 
 
-def _build_eagle3_recurrent_draft_extend(num_steps: int, topk: int):
-    """Build EAGLE3 draft-extend followed by recurrent one-token draft steps."""
+def _build_eagle3_recurrent_draft_extend(num_steps: int, topk: int, compiler_options=None):
+    """Build EAGLE3 draft-extend followed by recurrent one-token draft steps.
+    `compiler_options` are the draft attention backend's, as for its forward."""
     assert topk == 1, "Fused recurrent EAGLE3 draft extend only supports topk=1"
 
     from sgl_jax.srt.model_executor.forward_batch_info import (
@@ -939,6 +957,7 @@ def _build_eagle3_recurrent_draft_extend(num_steps: int, topk: int):
         jax.jit,
         donate_argnames=["memory_pools"],
         static_argnames=["model_state_def", "num_steps", "update_relay", "dp_size"],
+        compiler_options=compiler_options,
     )
     def fused_eagle3_draft_extend(
         model_def,
@@ -963,6 +982,7 @@ def _build_eagle3_recurrent_draft_extend(num_steps: int, topk: int):
         dp_size,
     ):
         logits_metadata = replace(logits_metadata, preserve_vocab_sharding=True)
+        model_leaves = _prepare_model_state(forward_batch.attn_backend, model_leaves)
         state = jax.tree_util.tree_unflatten(model_state_def, model_leaves)
         model = nnx.merge(model_def, state)
         base_metadata = forward_batch.attn_backend.forward_metadata
@@ -980,6 +1000,7 @@ def _build_eagle3_recurrent_draft_extend(num_steps: int, topk: int):
             query_lens=forward_batch.extend_seq_lens,
             page_size=forward_batch.attn_backend.page_size,
             dp_size=dp_size,
+            tokens=forward_batch.input_ids.shape[0] // forward_batch.seq_lens.shape[0],
         )
         forward_batch.spec_info.hidden_states = target_hidden
 
@@ -1087,8 +1108,9 @@ def _build_eagle3_recurrent_draft_extend(num_steps: int, topk: int):
     return fused_eagle3_draft_extend
 
 
-def _build_verify(topk: int):
-    """Build target forward + linear-chain verify JIT."""
+def _build_verify(topk: int, compiler_options=None):
+    """Build target forward + linear-chain verify JIT. `compiler_options` are
+    the target attention backend's, as for its forward."""
     assert topk == 1, "Fused greedy verify only supports topk=1"
 
     @partial(
@@ -1108,6 +1130,7 @@ def _build_verify(topk: int):
             "enable_top_p",
             "rebuild_verify_metadata",
         ],
+        compiler_options=compiler_options,
     )
     def fused_verify(
         target_model_def,
@@ -1201,6 +1224,7 @@ def _build_verify(topk: int):
         target_forward_batch.spec_info.retrive_next_token = retrive_next_token
         target_forward_batch.spec_info.retrive_next_sibling = retrive_next_sibling
 
+        target_leaves = _prepare_model_state(target_forward_batch.attn_backend, target_leaves)
         target_state = jax.tree_util.tree_unflatten(target_model_state_def, target_leaves)
         target_model = nnx.merge(target_model_def, target_state)
         target_logits_metadata = replace(
@@ -2090,10 +2114,13 @@ def launch_eagle3_recurrent_draft_extend_for_decode(
         )
 
     if not hasattr(draft_worker, "_fused_eagle3_recurrent_draft_extend_jit_fn"):
+        from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
+
         draft_worker._fused_eagle3_recurrent_draft_extend_jit_fn = (
             _build_eagle3_recurrent_draft_extend(
                 num_steps=draft_worker.speculative_num_steps,
                 topk=draft_worker.topk,
+                compiler_options=CompilationManager.compiler_options(runner.attn_backend),
             )
         )
 
@@ -2397,7 +2424,8 @@ def spec_decode_verify(
         target_mr.attn_backend.forward_metadata = target_mr.attn_backend.get_eagle_forward_metadata(
             model_worker_batch
         )
-    if use_relay_state and target_mr.attn_backend.forward_metadata.custom_mask is not None:
+    custom_mask = getattr(target_mr.attn_backend.forward_metadata, "custom_mask", None)
+    if use_relay_state and custom_mask is not None:
         raise NotImplementedError("Spec decode overlap relay path does not support custom_mask.")
     target_forward_batch = _make_forward_batch(model_worker_batch, target_mr)
     if rebuild_verify_metadata:
@@ -2429,8 +2457,11 @@ def spec_decode_verify(
     )
 
     if not hasattr(draft_worker, "_fused_greedy_verify_jit_fn"):
+        from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
+
         draft_worker._fused_greedy_verify_jit_fn = _build_verify(
             topk=draft_worker.topk,
+            compiler_options=CompilationManager.compiler_options(target_mr.attn_backend),
         )
 
     si = model_worker_batch.sampling_info
@@ -2528,6 +2559,14 @@ def spec_decode_verify(
         cache_miss_count = count()
 
     target_mr.memory_pools.replace_all(target_pool_updates)
+    # Hybrid recurrent targets keep each request's state after its accepted tokens.
+    keep_accepted = getattr(target_mr.attn_backend, "keep_accepted", None)
+    if keep_accepted is not None and model_worker_batch.recurrent_indices is not None:
+        keep_accepted(
+            target_mr.memory_pools,
+            prepared_accept_lens_data,
+            draft_worker.speculative_num_draft_tokens,
+        )
 
     next_draft_input = EagleDraftInput(
         verified_id=prepared_verified_id,

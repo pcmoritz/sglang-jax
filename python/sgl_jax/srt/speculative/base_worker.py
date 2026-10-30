@@ -93,9 +93,9 @@ class BaseSpecWorker:
             self.speculative_algorithm.is_nextn() and can_use_linear_fused_verify
         )
         self._can_use_fused_eagle3_verify = (
-            self.speculative_algorithm.is_eagle3()
+            (self.speculative_algorithm.name, server_args.attention_backend)
+            in (("EAGLE3", "fa"), ("EAGLE", "tt"))
             and can_use_linear_fused_verify
-            and server_args.attention_backend == "fa"
             and os.getenv("SGL_JAX_DISABLE_FUSED_EAGLE3_RECURRENT_DRAFT") != "1"
         )
 
@@ -392,18 +392,6 @@ class BaseSpecWorker:
             self.draft_worker.draft_model_runner.rngs,
             self.mesh,
         )
-        # Recurrent layers kept their state after each draft token; keep the
-        # accepted one. Precompile's dummy batches have no recurrent slots.
-        target_runner = self.target_worker.model_runner
-        keep_accepted = getattr(target_runner.attn_backend, "keep_accepted", None)
-        if keep_accepted is not None and model_worker_batch.recurrent_indices is not None:
-            slots = np.asarray(model_worker_batch.recurrent_indices)
-            keep_accepted(
-                target_runner.memory_pools,
-                slots,
-                accept_length[: len(slots)],
-                spec_info.draft_token_num,
-            )
         legacy_non_overlap = use_legacy_eagle3_non_overlap(
             not self.server_args.disable_overlap_schedule,
             getattr(model_worker_batch, "spec_algorithm", None),

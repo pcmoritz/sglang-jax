@@ -77,6 +77,11 @@ class SpeculativeAlgorithm(IntEnum):
     def is_eagle3(self):
         return self == SpeculativeAlgorithm.EAGLE3
 
+    def drafts_recursively(self):
+        """EAGLE and EAGLE3 run one draft layer per step on its own last hidden
+        state, unlike NEXTN's layer per step."""
+        return self in (SpeculativeAlgorithm.EAGLE, SpeculativeAlgorithm.EAGLE3)
+
     def is_nextn(self):
         return self == SpeculativeAlgorithm.NEXTN
 

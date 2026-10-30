@@ -19,7 +19,6 @@ from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
     LinearRecurrentAttnBackendMetadata,
 )
 from sgl_jax.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
-from sgl_jax.srt.mem_cache.recurrent_state_pool import accepted_state_slots
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.utils.jax_utils import device_array
 
@@ -72,10 +71,36 @@ def _per_device(forward):
     return run
 
 
+def verify_state_slots(slots, tokens: int, slots_per_rank: int):
+    """[B, tokens] slots for the state after each of a verify's tokens, for
+    NumPy or JAX slots.
+
+    The state after the last token goes to the request's own slot, the others
+    to the request's verify slots. Rows with slot 0 (padding) stay 0.
+    """
+    xp = jnp if isinstance(slots, jax.Array) else np
+    steps = xp.arange(tokens, dtype=np.int32)
+    first = slots_per_rank + 1 + (slots - 1) * (tokens - 1)
+    states = xp.where(steps == tokens - 1, slots[:, None], first[:, None] + steps)
+    return xp.where(slots[:, None] > 0, states, 0).astype(np.int32)
+
+
+def accepted_state_slots(slots, accepted, tokens: int, slots_per_rank: int):
+    """The verify slot holding each request's state after its `accepted`
+    tokens (of `tokens`), or 0 where the request's own slot already holds it
+    or the row is padding."""
+    xp = jnp if isinstance(slots, jax.Array) else np
+    states = verify_state_slots(slots, tokens, slots_per_rank)
+    last = xp.clip(accepted, 1, tokens)[:, None] - 1
+    source = xp.where(xp.arange(tokens) == last, states, 0).sum(axis=1)
+    return xp.where(last[:, 0] < tokens - 1, source, 0).astype(np.int32)
+
+
 @functools.cache
-def _keep_states(mesh):
-    """A traced program copying source slots to target slots, in place, in
-    every layer's recurrent and convolution pools."""
+def _keep_states(mesh, tokens: int, slots_per_rank: int):
+    """A program that, after a verify of `tokens` tokens per request, copies
+    each request's state after its accepted tokens from its verify slot to
+    its own slot, in place, in every layer's recurrent and convolution pools."""
 
     def copy(pool, source, target):
         for start in range(0, source.shape[0], MAX_DECODE_USERS):
@@ -83,7 +108,9 @@ def _keep_states(mesh):
             pool = ops.state_pool_copy(pool, source[rows], target[rows])
         return pool
 
-    def keep(recurrent, conv, source, target):
+    def keep(recurrent, conv, slots, accepted):
+        source = accepted_state_slots(slots, accepted, tokens, slots_per_rank)
+        target = jnp.where(source > 0, slots, 0)
         rows = P("data")
         copy_states = jax.shard_map(
             copy,
@@ -141,19 +168,22 @@ class TTGDNAttnBackend(GDNAttnBackend):
             )
         return meta
 
-    def keep_accepted(self, pool, slots, accepted, tokens: int) -> None:
-        """Copy each request's state after its accepted draft tokens from its
-        verify slot to its own slot. The copy is in place: the next forward's
-        trace was captured with the pool's current buffers."""
-        source = accepted_state_slots(slots, accepted, tokens, pool.slots_per_rank)
-        if not source.any():
-            return
-        target = np.where(source > 0, slots, 0).astype(np.int32)
-        source, target = device_array(
-            (source, target), sharding=NamedSharding(self.mesh, P("data"))
-        )
+    def keep_accepted(self, pool, accepted, tokens: int) -> None:
+        """After the current verify, keep each request's state after its
+        `accepted` tokens (host or device counts, one per verify row). The copy
+        is in place: the next forward's trace was captured with the pool's
+        current buffers."""
+        sharding = NamedSharding(self.mesh, P("data"))
+        if not isinstance(accepted, jax.Array):
+            accepted = device_array(np.asarray(accepted, dtype=np.int32), sharding=sharding)
+        keep = _keep_states(self.mesh, tokens, pool.slots_per_rank)
         pool.replace_buffer(
-            _keep_states(self.mesh)(pool.recurrent_buffers, pool.conv_buffers, source, target)
+            keep(
+                pool.recurrent_buffers,
+                pool.conv_buffers,
+                self.forward_metadata.recurrent_indices,
+                accepted,
+            )
         )
 
     def _verify_metadata(self, batch):
@@ -250,10 +280,7 @@ class TTGDNAttnBackend(GDNAttnBackend):
         rows = recurrent_state_in.shape[0]
         if (rows - 1) % tokens:
             raise ValueError("The recurrent state pool has no verify slots for this draft length")
-        first = (rows - 1) // tokens + 1 + (indices - 1) * (tokens - 1)
-        states = first[:, None] + jnp.arange(tokens, dtype=indices.dtype)
-        states = jnp.where(jnp.arange(tokens) == tokens - 1, indices[:, None], states)
-        states = jnp.where(indices[:, None] > 0, states, 0)
+        states = verify_state_slots(indices, tokens, (rows - 1) // tokens)
 
         # The kernels carry each state through its tokens and write the state
         # after each one to its slot, a tile row of tokens per call.

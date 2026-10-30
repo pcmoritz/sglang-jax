@@ -9,7 +9,6 @@ from typing import Literal
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
@@ -100,30 +99,6 @@ def recurrent_state_dtype() -> RecurrentStateDType:
         conv=_resolve_dtype("SGLANG_JAX_CONV_STATE_DTYPE", jnp.bfloat16),
         temporal=_resolve_dtype("SGLANG_JAX_RECURRENT_STATE_DTYPE", jnp.float32),
     )
-
-
-def verify_state_slots(slots: np.ndarray, tokens: int, slots_per_rank: int) -> np.ndarray:
-    """[B, tokens] slots for the state after each of a verify's tokens.
-
-    The state after the last token goes to the request's own slot, the others
-    to the request's verify slots. Rows with slot 0 (padding) stay 0.
-    """
-    slots = np.asarray(slots, dtype=np.int32)
-    first = slots_per_rank + 1 + (slots - 1) * (tokens - 1)
-    states = first[:, None] + np.arange(tokens, dtype=np.int32)
-    states[:, -1] = slots
-    return np.where(slots[:, None] > 0, states, 0).astype(np.int32)
-
-
-def accepted_state_slots(
-    slots: np.ndarray, accepted: np.ndarray, tokens: int, slots_per_rank: int
-) -> np.ndarray:
-    """The verify slot holding each request's state after its accepted tokens,
-    or 0 where the request's own slot already holds it (copy_slots' no-op)."""
-    states = verify_state_slots(slots, tokens, slots_per_rank)
-    accepted = np.clip(np.asarray(accepted, dtype=np.int32), 1, tokens)
-    source = np.take_along_axis(states, accepted[:, None] - 1, axis=1)[:, 0]
-    return np.where(accepted < tokens, source, 0).astype(np.int32)
 
 
 @register_pytree_node_class

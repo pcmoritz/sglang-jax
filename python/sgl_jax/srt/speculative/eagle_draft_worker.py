@@ -560,7 +560,7 @@ class EagleDraftWorker(BaseDraftWorker):
 
     def _has_precomputed_recurrent_chain(self, topk_index) -> bool:
         return (
-            self.speculative_algorithm.is_eagle3()
+            self.speculative_algorithm.drafts_recursively()
             and self.topk == 1
             and topk_index is not None
             and len(topk_index.shape) == 2

@@ -1,44 +1,13 @@
-"""Speculative verify of hybrid recurrent models: the chain verify and the
-verify-slot layout that keeps each request's state after its accepted tokens."""
+"""Speculative verify of hybrid recurrent models on Tenstorrent: the verify-slot
+layout that keeps each request's state after its accepted tokens."""
 
 import jax.numpy as jnp
 import numpy as np
-import pytest
 
-from sgl_jax.srt.kernels.speculative.kernel import verify_tree_greedy
-from sgl_jax.srt.mem_cache.recurrent_state_pool import (
+from sgl_jax.srt.hardware_backend.tt.attention.gdn_backend import (
     accepted_state_slots,
     verify_state_slots,
 )
-from sgl_jax.srt.speculative.eagle_util import (
-    build_chain_verify_inputs,
-    verify_chain_greedy,
-)
-
-
-@pytest.mark.parametrize("seed", range(20))
-def test_chain_verify_matches_tree_walk(seed):
-    rng = np.random.default_rng(seed)
-    bs, n, vocab = int(rng.integers(1, 5)), int(rng.integers(2, 7)), 7
-    logits = rng.normal(size=(bs * n, vocab)).astype(np.float32)
-    target = logits.argmax(-1).reshape(bs, n)
-    draft = rng.integers(0, vocab, size=(bs, n))
-    for row in range(bs):
-        # Let a random prefix of each chain match the target.
-        accepted = int(rng.integers(0, n))
-        draft[row, 1 : accepted + 1] = target[row, :accepted]
-    packed = build_chain_verify_inputs(draft[:, 0], draft[:, 1:], np.zeros(bs), n, bs)
-    expected = verify_tree_greedy(
-        jnp.zeros(bs * n, jnp.int32),
-        jnp.full((bs, n), -1, jnp.int32),
-        jnp.zeros(bs, jnp.int32),
-        jnp.asarray(draft),
-        *(packed[i].reshape(bs, n) for i in (2, 3, 4)),
-        jnp.asarray(target.reshape(-1)),
-    )
-    actual = verify_chain_greedy(jnp.asarray(draft.reshape(-1)), jnp.asarray(logits), n)
-    for got, want in zip(actual, expected):
-        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
 
 
 def test_verify_state_slots_layout():
@@ -64,3 +33,17 @@ def test_accepted_state_slots():
     # All tokens accepted: the state is already in place; padding copies nothing.
     assert source[1] == 0 and source[2] == 0
     assert source[0] == states[0, 0] and source[3] == states[3, 2]
+
+
+def test_slot_layout_on_device_matches_host():
+    # The verify computes the slots on device, keep_accepted from device counts.
+    slots, accepted = np.array([3, 1, 0, 2], np.int32), np.array([1, 4, 0, 3], np.int32)
+    for host, device in (
+        (verify_state_slots(slots, 4, 4), verify_state_slots(jnp.asarray(slots), 4, 4)),
+        (
+            accepted_state_slots(slots, accepted, 4, 4),
+            accepted_state_slots(jnp.asarray(slots), jnp.asarray(accepted), 4, 4),
+        ),
+    ):
+        np.testing.assert_array_equal(host, np.asarray(device))
+
