@@ -62,6 +62,8 @@ class Sampler(nnx.Module):
             sampling_metadata.temperatures,
             sampling_metadata.sampling_seeds,
             sampling_metadata.need_min_p_sampling,
+            sampling_metadata.need_top_p_sampling,
+            sampling_metadata.need_top_k_sampling,
             rng,
         )
         batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_jax_with_mask(args)
@@ -354,6 +356,8 @@ def top_k_top_p_min_p_sampling_from_probs_jax_with_mask(args):
         temperatures,
         sampling_seeds,
         need_min_p_sampling,
+        need_top_p_sampling,
+        need_top_k_sampling,
         rng,
     ) = args
     logits = logits.astype(jnp.float32)
@@ -365,9 +369,28 @@ def top_k_top_p_min_p_sampling_from_probs_jax_with_mask(args):
 
     # top-p first: `topp_mask` softmaxes internally, so after top-k it would
     # measure the nucleus on the renormalized tail. `topk_mask` ranks by value,
-    # so it is unaffected by the sentinels top-p leaves behind.
-    logits = topp_mask(logits, top_ps, replace_val=_MASK_FILL_VALUE)
-    logits = topk_mask(logits, top_ks, replace_val=_MASK_FILL_VALUE)
+    # so it is unaffected by the sentinels top-p leaves behind. Each mask is a
+    # 31-step search over the vocabulary; a batch where no request sets the
+    # parameter skips it, since the mask would keep every token. One switch
+    # picks the masks the batch needs.
+    def masks(use_top_p, use_top_k):
+        def apply(operands):
+            masked, top_ps, top_ks = operands
+            if use_top_p:
+                masked = topp_mask(masked, top_ps, replace_val=_MASK_FILL_VALUE)
+            if use_top_k:
+                masked = topk_mask(masked, top_ks, replace_val=_MASK_FILL_VALUE)
+            return masked
+
+        return apply
+
+    branch = jnp.asarray(need_top_p_sampling, jnp.int32)
+    branch += 2 * jnp.asarray(need_top_k_sampling, jnp.int32)
+    logits = lax.switch(
+        branch,
+        [masks(False, False), masks(True, False), masks(False, True), masks(True, True)],
+        (logits, top_ps, top_ks),
+    )
 
     min_p_operands = (logits, min_ps)
     logits = lax.cond(

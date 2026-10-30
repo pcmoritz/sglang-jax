@@ -266,6 +266,7 @@ suites = {
         TestFile("python/sgl_jax/test/kernels/kda_test.py", 10, runner="pytest"),
         TestFile("test/srt/kernels/hca/test_hca.py", 8, runner="pytest"),
         TestFile("test/srt/kernels/hca/test_v4_backend.py", 5, runner="pytest"),
+        TestFile("test/srt/kernels/csa_attention/test_attention.py", 3, runner="pytest"),
         TestFile("test/srt/kernels/csa_compressor/test_compressor.py", 3, runner="pytest"),
         TestFile("test/srt/kernels/mhc/test_mhc.py", 2, runner="pytest"),
         # Pytest tears down the shared FlashAttention mesh cleanly on JAX 0.10.2.
@@ -339,10 +340,18 @@ suites = {
             0.1,
             env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "2"},
         ),
+        TestFile("python/sgl_jax/test/models/test_qwen4_exp.py", 0.3, runner="pytest"),
         TestFile("test/srt/kernels/qsa/test_sparse_gqa_ref.py", 0.1),
         TestFile("test/srt/kernels/qsa/test_paging.py", 0.1),
         TestFile("test/srt/kernels/qsa/test_qsa_pipeline.py", 0.5),
         TestFile("test/srt/mem_cache/test_qsa_pool.py", 0.1),
+        TestFile(
+            "python/sgl_jax/test/layers/test_ngram_embedding.py",
+            0.1,
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "2"},
+        ),
+        TestFile("python/sgl_jax/test/layers/test_ngram_table.py", 0.1),
+        TestFile("python/sgl_jax/test/mem_cache/test_recurrent_short_conv.py", 0.1),
         TestFile(
             "python/sgl_jax/test/test_embedding_pool.py",
             0.1,
@@ -407,6 +416,11 @@ suites = {
         TestFile("test/srt/test_dtype_config_consistency.py", 10),
         TestFile("python/sgl_jax/test/test_compilation_manager.py", 1),
         TestFile("python/sgl_jax/test/test_kernel_utils.py", 1),
+        TestFile(
+            "python/sgl_jax/test/test_mla_v2_bitexact.py",
+            0.4,
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
         TestFile("python/sgl_jax/test/speculative/test_dflash_info.py", 0.2, runner="pytest"),
         TestFile(
             "python/sgl_jax/test/speculative/test_dflash_server_args.py",

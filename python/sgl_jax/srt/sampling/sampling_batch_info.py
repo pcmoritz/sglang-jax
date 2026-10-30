@@ -62,6 +62,10 @@ class SamplingMetadata:
     positions: jax.Array
     is_all_greedy: bool = False
     need_min_p_sampling: bool = False
+    # Whether any request sets top_p < 1 / a top_k. Without one, the top-p and
+    # top-k masks would keep every token, so the sampler skips their searches.
+    need_top_p_sampling: bool = True
+    need_top_k_sampling: bool = True
 
     # penalty
     do_penalties: bool = False
@@ -95,6 +99,8 @@ class SamplingMetadata:
             self.do_penalties,
             self.vocab_mask,
             self.apply_vocab_mask,
+            self.need_top_p_sampling,
+            self.need_top_k_sampling,
         )
 
         aux_data = {
@@ -120,6 +126,8 @@ class SamplingMetadata:
         obj.do_penalties = children[9]
         obj.vocab_mask = children[10]
         obj.apply_vocab_mask = children[11]
+        obj.need_top_p_sampling = children[12]
+        obj.need_top_k_sampling = children[13]
 
         obj.return_logprob = aux_data["return_logprob"]
         obj.top_logprobs_nums = aux_data["top_logprobs_nums"]
@@ -244,6 +252,8 @@ class SamplingMetadata:
             is_all_greedy=bools[bool(batch.sampling_info.is_all_greedy)],
             positions=positions_device,
             need_min_p_sampling=bools[bool(batch.sampling_info.need_min_p_sampling)],
+            need_top_p_sampling=bools[bool(batch.sampling_info.need_top_p_sampling)],
+            need_top_k_sampling=bools[bool(batch.sampling_info.need_top_k_sampling)],
             linear_penalty=linear_penalty_device,
             do_penalties=bools[do_penalties],
             # The worker installs the current grammar mask after its update completes.
@@ -469,6 +479,14 @@ class SamplingBatchInfo:
             value = getattr(self, item, None)
             if value is not None:
                 setattr(self, item, value[keep_indices])
+
+        # Merges only AND/OR these, so recompute them for the requests that remain:
+        # a finished top-p request must not keep the rest running its search, and
+        # a finished sampled request must not keep greedy ones off argmax.
+        self.is_all_greedy = bool(np.all(self.top_ks <= 1))
+        self.need_top_p_sampling = bool(np.any(self.top_ps != 1.0))
+        self.need_top_k_sampling = bool(np.any(self.top_ks != TOP_K_ALL))
+        self.need_min_p_sampling = bool(np.any(self.min_ps > 0.0))
 
     def merge_batch(self, other: SamplingBatchInfo):
         if self.penalizer_orchestrator is not None:
