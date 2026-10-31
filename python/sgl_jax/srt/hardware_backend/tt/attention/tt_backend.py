@@ -57,16 +57,12 @@ class TTTokenToKVPool(MHATokenToKVPool):
                 for _ in range(self.layer_num)
             ]
             return
-        zeros = np.zeros(shape, dtype=np.dtype(self.dtype))
+        # Made on the device: libtt keeps arrays put from host memory there until
+        # a program first uses them.
+        zeros = jax.jit(lambda: jnp.zeros(shape, self.dtype), out_shardings=self.kv_sharding)
         start = time.time()
         with self.mesh:
-            self.kv_buffer = [
-                (
-                    jax.device_put(zeros.copy(), self.kv_sharding),
-                    jax.device_put(zeros.copy(), self.kv_sharding),
-                )
-                for _ in range(self.layer_num)
-            ]
+            self.kv_buffer = [(zeros(), zeros()) for _ in range(self.layer_num)]
         logger.info("Created TT KV buffers in %.2f seconds", time.time() - start)
 
     def set_kv_buffer(self, layer_id, loc, k, v, is_decode=False):
