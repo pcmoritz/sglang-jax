@@ -87,10 +87,11 @@ def accepted_state_slots(slots, accepted, tokens: int, slots_per_rank: int):
     """The verify slot holding each request's state after its `accepted`
     tokens (of `tokens`), or 0 where the request's own slot already holds it
     or the row is padding."""
+    states = verify_state_slots(slots, tokens, slots_per_rank)
     count = jnp.clip(accepted, 1, tokens)
-    first = slots_per_rank + 1 + (slots - 1) * (tokens - 1)
-    source = first + count - 1
-    return jnp.where((slots > 0) & (count < tokens), source, 0).astype(jnp.int32)
+    picked = jnp.arange(tokens) == (count - 1)[:, None]
+    source = jnp.where(picked, states, 0).sum(axis=1)
+    return jnp.where(count < tokens, source, 0).astype(jnp.int32)
 
 
 @functools.cache

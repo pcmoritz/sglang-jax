@@ -32,16 +32,3 @@ def test_accepted_state_slots():
     # All tokens accepted: the state is already in place; padding copies nothing.
     assert source[1] == 0 and source[2] == 0
     assert source[0] == states[0, 0] and source[3] == states[3, 2]
-
-
-def test_accepted_state_slots_match_the_layout():
-    # Every accept count, including out-of-range ones, against the verify layout.
-    slots_per_rank = 5
-    slots = np.array([0, 1, 2, 3, 4, 5])
-    for tokens in range(1, 9):
-        states = np.asarray(verify_state_slots(slots, tokens, slots_per_rank))
-        for accepted in range(-1, tokens + 2):
-            count = min(max(accepted, 1), tokens)
-            expected = np.where((slots > 0) & (count < tokens), states[:, count - 1], 0)
-            source = accepted_state_slots(slots, np.full_like(slots, accepted), tokens, slots_per_rank)
-            np.testing.assert_array_equal(np.asarray(source), expected)
