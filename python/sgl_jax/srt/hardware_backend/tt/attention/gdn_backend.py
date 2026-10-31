@@ -167,12 +167,9 @@ class TTGDNAttnBackend(GDNAttnBackend):
 
     def keep_accepted(self, pool, accepted, tokens: int) -> None:
         """After the current verify, keep each request's state after its
-        `accepted` tokens (host or device counts, one per verify row). The copy
-        is in place: the next forward's trace was captured with the pool's
-        current buffers."""
-        sharding = NamedSharding(self.mesh, P("data"))
-        if not isinstance(accepted, jax.Array):
-            accepted = device_array(np.asarray(accepted, dtype=np.int32), sharding=sharding)
+        `accepted` tokens (one count per verify row, on device). The copy is in
+        place: the next forward's trace was captured with the pool's current
+        buffers."""
         keep = _keep_states(self.mesh, tokens, pool.slots_per_rank)
         pool.replace_buffer(
             keep(
@@ -306,7 +303,7 @@ class TTGDNAttnBackend(GDNAttnBackend):
                 state_slots=states[requests],
             )
             outputs.append(out)
-        out = jnp.concatenate(outputs) if len(outputs) > 1 else outputs[0]
+        out = jnp.concatenate(outputs)
         return out.astype(mixed_qkv.dtype), conv, state
 
     @_per_device
