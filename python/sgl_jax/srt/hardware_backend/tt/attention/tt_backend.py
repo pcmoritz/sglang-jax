@@ -270,6 +270,23 @@ class TTAttention(AttentionBackend):
         metadata.page_table = device_array(page_table, sharding=NamedSharding(self.mesh, P("data")))
         return metadata
 
+    def get_eagle_multi_step_metadata(self, batch: ModelWorkerBatch):
+        """Metadata for each of an EAGLE draft's decode steps.
+
+        Step i writes and attends up to position seq_len - 1 + i, the next
+        position after the request's verified tokens.
+        """
+        page_table = self.get_eagle_base_metadata(batch).page_table
+        lengths = np.asarray(batch.seq_lens, dtype=np.int32)
+        positions = device_array(
+            [
+                np.where(lengths > 0, lengths - 1 + step, -1).astype(np.int32)
+                for step in range(batch.speculative_num_steps)
+            ],
+            sharding=NamedSharding(self.mesh, P("data")),
+        )
+        return [TTAttentionMetadata(page_table=page_table, positions=step) for step in positions]
+
     def _decode_metadata(self, batch: ModelWorkerBatch) -> TTAttentionMetadata:
         sequence_lengths = np.asarray(batch.seq_lens, dtype=np.int32)[: batch.real_bs]
 
