@@ -208,9 +208,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         if server_args.device == "tt" and not self.is_draft_worker:
             from sgl_jax.srt.hardware_backend.tt.memory import place_weights
 
-            place_weights(
-                self, server_args.max_running_requests, total_device_memory, server_args.dp_size
-            )
+            place_weights(self, server_args.max_running_requests, server_args.dp_size)
         self.init_memory_pool(
             server_args.max_running_requests,
             server_args.max_total_tokens,

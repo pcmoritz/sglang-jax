@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 _WARMUP_TOKENS = 1024
 
 
-def place_weights(model_runner, max_num_reqs, total_device_memory, dp_size):
+def place_weights(model_runner, max_num_reqs, dp_size):
     """Run one decode step so the device holds the model's weights.
 
     libtt keeps parameters in host memory and makes their device copies (BFP8
@@ -25,7 +25,9 @@ def place_weights(model_runner, max_num_reqs, total_device_memory, dp_size):
     from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
     runner = model_runner
-    runner.init_memory_pool(max_num_reqs, _WARMUP_TOKENS, total_device_memory, dp_size=dp_size)
+    # No static-memory reserve for the step's pool: before the step, the device
+    # may still hold copies the step releases.
+    runner.init_memory_pool(max_num_reqs, _WARMUP_TOKENS, 0, dp_size=dp_size)
     shapes = CompilationManager(
         server_args=runner.server_args,
         max_padded_batch_size=dp_size,
