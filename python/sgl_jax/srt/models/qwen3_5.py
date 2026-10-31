@@ -530,12 +530,9 @@ class Qwen3_5MoeModel(nnx.Module):
         )
         self.norm = GemmaRMSNorm(text_cfg.hidden_size, epsilon=text_cfg.rms_norm_eps)
 
-    def __call__(self, forward_batch: ForwardBatch, memory_pools):
-        input_embeds = (
-            forward_batch.input_embedding
-            if forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
-            else None
-        )
+    def __call__(self, forward_batch: ForwardBatch, memory_pools, input_embeds=None):
+        if input_embeds is None and forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+            input_embeds = forward_batch.input_embedding
         hidden_states = (
             self.embed_tokens(forward_batch.input_ids) if input_embeds is None else input_embeds
         )
